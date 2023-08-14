@@ -9,8 +9,10 @@
 //!
 //!     cargo run --example hello_client --features=disk-db
 
+#![allow(incomplete_features)]
+#![feature(async_fn_in_trait)]
 #![allow(unused)]
-use async_trait::async_trait;
+
 use log::debug;
 use sealfs::rpc::server::{Handler, RpcServer};
 use std::sync::Arc;
@@ -27,7 +29,6 @@ impl HelloHandler {
 //     static ref HELLO_COUNT: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 // }
 
-#[async_trait]
 impl Handler for HelloHandler {
     async fn dispatch(
         &self,

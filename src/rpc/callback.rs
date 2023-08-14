@@ -29,8 +29,8 @@ pub struct OperationCallback {
     pub receiver: *mut Receiver<()>,
 }
 
-unsafe impl std::marker::Sync for OperationCallback {}
-unsafe impl std::marker::Send for OperationCallback {}
+unsafe impl Sync for OperationCallback {}
+unsafe impl Send for OperationCallback {}
 
 impl Default for OperationCallback {
     fn default() -> Self {
@@ -250,8 +250,8 @@ impl CallbackPool {
     }
 }
 
-unsafe impl std::marker::Sync for CallbackPool {}
-unsafe impl std::marker::Send for CallbackPool {}
+unsafe impl Sync for CallbackPool {}
+unsafe impl Send for CallbackPool {}
 
 #[allow(unused)]
 #[cfg(test)]

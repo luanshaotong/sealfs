@@ -2,9 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{sync::Arc, future::Future};
 
-use async_trait::async_trait;
 use log::{error, info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -13,9 +12,9 @@ use tokio::{
 
 use super::{connection::ServerConnection, protocol::RequestHeader};
 
-#[async_trait]
+
 pub trait Handler {
-    async fn dispatch(
+    fn dispatch(
         &self,
         id: u32,
         operation_type: u32,
@@ -23,11 +22,11 @@ pub trait Handler {
         path: Vec<u8>,
         data: Vec<u8>,
         metadata: Vec<u8>,
-    ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)>;
+    ) -> impl Future<Output = anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)>> + Send + '_;
 }
 
 pub async fn handle<
-    H: Handler + std::marker::Sync + std::marker::Send + 'static,
+    H: Handler + Sync + Send + 'static,
     W: AsyncWriteExt + Unpin,
     R: AsyncReadExt + Unpin,
 >(
@@ -71,9 +70,9 @@ pub async fn handle<
 }
 
 pub async fn receive<
-    H: Handler + std::marker::Sync + std::marker::Send + 'static,
-    W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
-    R: AsyncReadExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
+    H: Handler + Sync + Send + 'static,
+    W: AsyncWriteExt + Unpin + Sync + Send + 'static,
+    R: AsyncReadExt + Unpin + Sync + Send + 'static,
 >(
     handler: Arc<H>,
     connection: Arc<ServerConnection<W, R>>,
@@ -106,13 +105,13 @@ pub async fn receive<
     }
 }
 
-pub struct RpcServer<H: Handler + std::marker::Sync + std::marker::Send + 'static> {
+pub struct RpcServer<H: Handler + Sync + Send + 'static> {
     // listener: TcpListener,
     bind_address: String,
     handler: Arc<H>,
 }
 
-impl<H: Handler + std::marker::Sync + std::marker::Send> RpcServer<H> {
+impl<H: Handler + Sync + Send> RpcServer<H> {
     pub fn new(handler: Arc<H>, bind_address: &str) -> Self {
         Self {
             handler,

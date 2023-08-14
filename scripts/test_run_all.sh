@@ -27,8 +27,8 @@ fi
 
 set +e
 
-rm /tmp/sealfs.sock
-rm /tmp/sealfs.index
+sudo rm /tmp/sealfs.sock
+sudo rm /tmp/sealfs.index
 sudo umount ~/fs
 mkdir -p ~/fs
 

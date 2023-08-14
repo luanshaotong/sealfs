@@ -6,8 +6,8 @@ struct CStrPointer {
     _p: *const u8,
 }
 
-unsafe impl std::marker::Sync for CStrPointer {}
-unsafe impl std::marker::Send for CStrPointer {}
+unsafe impl Sync for CStrPointer {}
+unsafe impl Send for CStrPointer {}
 lazy_static::lazy_static! {
     static ref LOG_BUF: Vec<u8> = vec![0u8; 10];
 }

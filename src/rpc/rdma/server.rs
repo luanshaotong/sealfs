@@ -10,15 +10,15 @@ use crate::rpc::{
     protocol::{RequestHeader, REQUEST_HEADER_SIZE, RESPONSE_HEADER_SIZE},
     server::Handler,
 };
-pub struct Server<H: Handler + std::marker::Sync + std::marker::Send + 'static> {
+pub struct Server<H: Handler + Sync + Send + 'static> {
     pub addr: String,
     incoming: MyReceiver<Conn>,
     handler: Arc<H>,
 }
 
-impl<H: Handler + std::marker::Sync + std::marker::Send> Server<H>
+impl<H: Handler + Sync + Send> Server<H>
 where
-    H: Handler + std::marker::Sync + std::marker::Send + 'static,
+    H: Handler + Sync + Send + 'static,
 {
     pub async fn new(addr: String, handler: Arc<H>) -> Self {
         let (tx, rx) = channel(1000);
@@ -46,7 +46,7 @@ where
     }
 }
 
-pub async fn receive<H: Handler + std::marker::Sync + std::marker::Send + 'static>(
+pub async fn receive<H: Handler + Sync + Send + 'static>(
     handler: Arc<H>,
     conn: Arc<Conn>,
 ) {
@@ -108,7 +108,7 @@ pub fn parse_request(request: &[u8]) -> (RequestHeader, Vec<u8>, Vec<u8>, Vec<u8
 // handle(): handle the request
 // 1. call the handler to handle the request
 // 2. send the response back to the client
-async fn handle<H: Handler + std::marker::Sync + std::marker::Send + 'static>(
+async fn handle<H: Handler + Sync + Send + 'static>(
     handler: Arc<H>,
     conn: Arc<Conn>,
     header: RequestHeader,

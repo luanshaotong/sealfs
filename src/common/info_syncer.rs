@@ -41,6 +41,8 @@ async fn sync_cluster_infos<I: InfoSyncer>(client: Arc<I>) {
     }
 }
 
+// now we can't use original async trait support in rust compiler because we need the
+// default implementation of the trait method. So we use this macro to generate the
 #[async_trait]
 pub trait ClientStatusMonitor: InfoSyncer {
     fn hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>>;

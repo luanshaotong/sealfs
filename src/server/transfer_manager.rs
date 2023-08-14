@@ -16,8 +16,8 @@ pub struct TransferManager {
     transferring_status: DashMap<String, bool>,
 }
 
-unsafe impl std::marker::Sync for TransferManager {}
-unsafe impl std::marker::Send for TransferManager {}
+unsafe impl Sync for TransferManager {}
+unsafe impl Send for TransferManager {}
 
 impl Default for TransferManager {
     fn default() -> Self {

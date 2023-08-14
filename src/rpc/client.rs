@@ -15,8 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[async_trait]
 pub trait StreamCreator<
-    R: AsyncReadExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
-    W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
+    R: AsyncReadExt + Unpin + Sync + Send + 'static,
+    W: AsyncWriteExt + Unpin + Sync + Send + 'static,
 >
 {
     async fn create_stream(server_address: &str) -> Result<(R, W), String>;
@@ -73,8 +73,8 @@ impl StreamCreator<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWrite
 }
 
 pub struct RpcClient<
-    R: AsyncReadExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
-    W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
+    R: AsyncReadExt + Unpin + Sync + Send + 'static,
+    W: AsyncWriteExt + Unpin + Sync + Send + 'static,
     S: StreamCreator<R, W>,
 > {
     connections: DashMap<String, Arc<ClientConnection<W, R>>>,
@@ -83,8 +83,8 @@ pub struct RpcClient<
 }
 
 impl<
-        R: AsyncReadExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
-        W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
+        R: AsyncReadExt + Unpin + Sync + Send + 'static,
+        W: AsyncWriteExt + Unpin + Sync + Send + 'static,
         S: StreamCreator<R, W>,
     > Default for RpcClient<R, W, S>
 {
@@ -94,8 +94,8 @@ impl<
 }
 
 impl<
-        R: AsyncReadExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
-        W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
+        R: AsyncReadExt + Unpin + Sync + Send + 'static,
+        W: AsyncWriteExt + Unpin + Sync + Send + 'static,
         S: StreamCreator<R, W>,
     > RpcClient<R, W, S>
 {

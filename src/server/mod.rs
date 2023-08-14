@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use log::{debug, error, info};
 use storage_engine::StorageEngine;
 use tokio::time::sleep;
@@ -333,23 +332,22 @@ pub async fn run(
     Ok(())
 }
 
-pub struct FileRequestHandler<S: StorageEngine + std::marker::Send + std::marker::Sync + 'static> {
+pub struct FileRequestHandler<S: StorageEngine + Send + Sync + 'static> {
     engine: Arc<DistributedEngine<S>>,
 }
 
 impl<S: StorageEngine> FileRequestHandler<S>
 where
-    S: StorageEngine + std::marker::Send + std::marker::Sync + 'static,
+    S: StorageEngine + Send + Sync + 'static,
 {
     pub fn new(engine: Arc<DistributedEngine<S>>) -> Self {
         Self { engine }
     }
 }
 
-#[async_trait]
 impl<S: StorageEngine> Handler for FileRequestHandler<S>
 where
-    S: StorageEngine + std::marker::Send + std::marker::Sync + 'static,
+    S: StorageEngine + Send + Sync + 'static,
 {
     // dispatch is the main function to handle the request from client
     // the return value is a tuple of (i32, u32, Vec<u8>, Vec<u8>)

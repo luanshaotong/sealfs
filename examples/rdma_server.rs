@@ -1,7 +1,9 @@
 //! cargo run --example rdma_server --features=disk-db
 //!
 
-use async_trait::async_trait;
+#![allow(incomplete_features)]
+#![feature(async_fn_in_trait)]
+
 use sealfs::rpc::{rdma::server::Server, server::Handler};
 use std::sync::Arc;
 pub struct HelloHandler {}
@@ -16,7 +18,6 @@ impl HelloHandler {
 //     static ref HELLO_COUNT: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 // }
 
-#[async_trait]
 impl Handler for HelloHandler {
     async fn dispatch(
         &self,

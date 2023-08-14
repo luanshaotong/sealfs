@@ -14,7 +14,6 @@ use crate::{
 
 use super::core::Manager;
 
-use async_trait::async_trait;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 
@@ -172,7 +171,6 @@ impl ManagerService {
     }
 }
 
-#[async_trait]
 impl Handler for ManagerService {
     async fn dispatch(
         &self,
