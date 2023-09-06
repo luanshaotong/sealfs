@@ -4,6 +4,7 @@ use super::transfer_manager::TransferManager;
 use crate::common::byte::CHUNK_SIZE;
 use crate::common::errors::CONNECTION_ERROR;
 use crate::common::hash_ring::HashRing;
+use crate::common::group_manager::GroupManager;
 use crate::common::sender::{Sender, REQUEST_TIMEOUT};
 use crate::common::serialization::{
     file_attr_as_bytes, ClusterStatus, CreateDirSendMetaData, CreateFileSendMetaData,
@@ -27,7 +28,8 @@ use std::{sync::Arc, vec};
 use tokio::sync::Mutex;
 
 pub struct DistributedEngine<Storage: StorageEngine> {
-    pub address: String,
+    pub group_id: String,
+    pub server_address: String,
     pub storage_engine: Arc<Storage>,
     pub meta_engine: Arc<MetaEngine>,
     pub client: Arc<
@@ -43,6 +45,7 @@ pub struct DistributedEngine<Storage: StorageEngine> {
 
     pub hash_ring: Arc<RwLock<Option<HashRing>>>,
     pub new_hash_ring: Arc<RwLock<Option<HashRing>>>,
+    pub group_manager: Arc<RwLock<GroupManager>>,
 
     pub manager_address: Arc<Mutex<String>>,
 
@@ -50,6 +53,8 @@ pub struct DistributedEngine<Storage: StorageEngine> {
     pub transfer_manager: TransferManager,
 
     pub closed: AtomicBool,
+
+    pub node_role: AtomicI32,
 }
 
 impl<Storage> DistributedEngine<Storage>
@@ -57,7 +62,8 @@ where
     Storage: StorageEngine,
 {
     pub fn new(
-        address: String,
+        group_id: String,
+        server_address: String,
         storage_engine: Arc<Storage>,
         meta_engine: Arc<MetaEngine>,
     ) -> Self {
@@ -67,7 +73,8 @@ where
         }
         let client = Arc::new(RpcClient::new());
         Self {
-            address,
+            group_id,
+            server_address,
             storage_engine,
             meta_engine,
             client: client.clone(),
@@ -75,10 +82,12 @@ where
             cluster_status: AtomicI32::new(ClusterStatus::Unkown.into()),
             hash_ring: Arc::new(RwLock::new(None)),
             new_hash_ring: Arc::new(RwLock::new(None)),
+            group_manager: Arc::new(RwLock::new(GroupManager::new(vec![]))),
             manager_address: Arc::new(Mutex::new("".to_string())),
             file_locks,
             transfer_manager: TransferManager::new(),
             closed: AtomicBool::new(false),
+            node_role: AtomicI32::new(0),
         }
     }
 
@@ -124,7 +133,7 @@ where
             .for_each(|result| {
                 let (k, _) = result.unwrap();
                 let k = String::from_utf8(k.to_vec()).unwrap();
-                if self.get_new_address(&k) != self.address {
+                if self.get_new_address(&k) != self.group_id {
                     file_map.push(k);
                 }
             });
@@ -387,13 +396,13 @@ where
             .unwrap()
             .get(path)
             .unwrap()
-            .address
+            .group_id
             .clone()
     }
 
     pub fn get_new_address(&self, path: &str) -> String {
         match self.new_hash_ring.read().as_ref() {
-            Some(ring) => ring.get(path).unwrap().address.clone(),
+            Some(ring) => ring.get(path).unwrap().group_id.clone(),
             None => self.get_address(path),
         }
     }
@@ -418,11 +427,11 @@ where
             ClusterStatus::SyncNewHashRing => (self.get_address(path), false),
             ClusterStatus::PreTransfer => {
                 let address = self.get_address(path);
-                if address != self.address {
+                if address != self.group_id {
                     (address, false)
                 } else {
                     let new_address = self.get_new_address(path);
-                    if new_address != self.address {
+                    if new_address != self.group_id {
                         // the most efficient way is to check the operation_type
                         // if operation_type is Create, forward the request to the new node
                         // here is a temporary solution
@@ -441,11 +450,11 @@ where
             }
             ClusterStatus::Transferring => {
                 let address = self.get_address(path);
-                if address != self.address {
+                if address != self.group_id {
                     (address, false)
                 } else {
                     let new_address = self.get_new_address(path);
-                    if new_address != self.address {
+                    if new_address != self.group_id {
                         match self.transfer_manager.status(path) {
                             Some(true) => (new_address, false),
                             Some(false) => (address, false),
@@ -458,11 +467,11 @@ where
             }
             ClusterStatus::PreFinish => {
                 let address = self.get_address(path);
-                if address != self.address {
+                if address != self.group_id {
                     (address, false)
                 } else {
                     let new_address = self.get_new_address(path);
-                    if new_address != self.address {
+                    if new_address != self.group_id {
                         (new_address, false)
                     } else {
                         (address, false)
@@ -491,7 +500,7 @@ where
             ClusterStatus::SyncNewHashRing => (None, false),
             ClusterStatus::PreTransfer => {
                 let address = self.get_new_address(path);
-                if address != self.address {
+                if address != self.group_id {
                     // the most efficient way is to check the operation_type
                     // if operation_type is Create, forward the request to the new node
                     // here is a temporary solution
@@ -509,7 +518,7 @@ where
             }
             ClusterStatus::Transferring => {
                 let address = self.get_new_address(path);
-                if address != self.address {
+                if address != self.group_id {
                     match self.transfer_manager.status(path) {
                         Some(true) => (Some(address), false),
                         Some(false) => (None, false),
@@ -521,7 +530,7 @@ where
             }
             ClusterStatus::PreFinish => {
                 let address = self.get_new_address(path);
-                if address != self.address {
+                if address != self.group_id {
                     (Some(address), false)
                 } else {
                     (None, false)
@@ -548,7 +557,7 @@ where
                 &self.manager_address.lock().await,
                 ManagerOperationType::UpdateServerStatus.into(),
                 0,
-                &self.address,
+                &self.group_id,
                 &send_meta_data,
                 &[],
                 &mut status,
@@ -590,6 +599,12 @@ where
     pub async fn get_new_hash_ring_info(&self) -> Result<Vec<(String, usize)>, i32> {
         self.sender
             .get_new_hash_ring_info(&self.manager_address.lock().await)
+            .await
+    }
+
+    pub async fn get_groups_info(&self) -> Result<Vec<(String, Vec<(String, ServerStatus)>)>, i32> {
+        self.sender
+            .get_groups_info(&self.manager_address.lock().await)
             .await
     }
 
@@ -718,7 +733,7 @@ where
             Ok(_) => {
                 let path = get_full_path(parent, name);
                 let (address, _lock) = self.get_server_address(&path);
-                if self.address == address {
+                if self.group_id == address {
                     debug!(
                         "local create dir, parent_dir: {}, file_name: {}",
                         parent, name
@@ -783,7 +798,7 @@ where
 
         let path = get_full_path(parent, name);
         let (address, _lock) = self.get_server_address(&path);
-        let result = if self.address == address {
+        let result = if self.group_id == address {
             debug!(
                 "local create dir, parent_dir: {}, file_name: {}",
                 parent, name
@@ -842,7 +857,7 @@ where
 
     pub async fn call_get_attr_remote_or_local(&self, path: &str) -> Result<Vec<u8>, i32> {
         let (address, _lock) = self.get_server_address(path);
-        if self.address == address {
+        if self.group_id == address {
             debug!("local get attr, path: {}", path);
             self.meta_engine.get_file_attr_raw(path)
         } else {
@@ -924,7 +939,7 @@ where
         let result = match result {
             Ok(_) => {
                 let (address, _lock) = self.get_server_address(&path);
-                let result = if self.address == address {
+                let result = if self.group_id == address {
                     debug!(
                         "local create file, parent_file: {}, file_name: {}",
                         parent, name
@@ -991,7 +1006,7 @@ where
 
         let path = get_full_path(parent, name);
         let (address, _lock) = self.get_server_address(&path);
-        let result = if self.address == address {
+        let result = if self.group_id == address {
             debug!(
                 "local create file, parent_file: {}, file_name: {}",
                 parent, name
@@ -1071,11 +1086,11 @@ where
             .directory_add_entry(path, &file_name, file_type)
         {
             Ok(()) => {
-                debug!("{} Directory Add Entry success", self.address);
+                debug!("{} Directory Add Entry success", self.group_id);
                 0
             }
             Err(value) => {
-                debug!("{} Directory Add Entry error: {:?}", self.address, value);
+                debug!("{} Directory Add Entry error: {:?}", self.group_id, value);
                 value
             }
         }
@@ -1103,7 +1118,7 @@ where
         {
             Ok(()) => 0,
             Err(value) => {
-                debug!("{} Directory Delete Entry error: {:?}", self.address, value);
+                debug!("{} Directory Delete Entry error: {:?}", self.group_id, value);
                 value
             }
         }
@@ -1144,12 +1159,12 @@ where
             .read()
             .as_ref()
             .unwrap()
-            .servers
+            .groups
             .keys()
             .cloned()
             .collect();
         for address in &server_addresses {
-            if address == &self.address {
+            if address == &self.group_id {
                 self.clean_volume(name).unwrap_or_else(|e| {
                     error!("clean volume failed: {:?}", e);
                 });
@@ -1164,14 +1179,14 @@ where
             }
         }
         let new_server_addresses = match self.new_hash_ring.read().as_ref() {
-            Some(new_hash_ring) => new_hash_ring.servers.keys().cloned().collect(),
+            Some(new_hash_ring) => new_hash_ring.groups.keys().cloned().collect(),
             None => vec![],
         };
         for address in &new_server_addresses {
             if server_addresses.contains(address) {
                 continue;
             }
-            if address == &self.address {
+            if address == &self.group_id {
                 self.clean_volume(name).unwrap_or_else(|e| {
                     error!("clean volume failed: {:?}", e);
                 });

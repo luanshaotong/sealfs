@@ -13,7 +13,7 @@ use tokio::time::sleep;
 
 use crate::common::errors::{self, status_to_string, CONNECTION_ERROR};
 
-use super::{hash_ring::HashRing, sender::Sender, serialization::ClusterStatus};
+use super::{hash_ring::HashRing, sender::Sender, serialization::{ClusterStatus, ServerStatus}, group_manager::GroupManager};
 
 #[async_trait]
 pub trait InfoSyncer {
@@ -45,23 +45,34 @@ async fn sync_cluster_infos<I: InfoSyncer>(client: Arc<I>) {
 pub trait ClientStatusMonitor: InfoSyncer {
     fn hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>>;
     fn new_hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>>;
+    fn replica_manager(&self) -> &Arc<RwLock<GroupManager>>;
     fn sender(&self) -> &Sender;
     fn manager_address(&self) -> &Arc<tokio::sync::Mutex<String>>;
 
     fn get_address(&self, path: &str) -> String {
-        self.hash_ring()
+        self.replica_manager().read().get_primary(
+         &self.hash_ring()
             .read()
             .as_ref()
             .unwrap()
             .get(path)
             .unwrap()
-            .address
-            .clone()
+            .group_id
+            .clone()  // may deadlock if not clone
+        ).unwrap()
     }
 
     fn get_new_address(&self, path: &str) -> String {
-        match self.new_hash_ring().read().as_ref() {
-            Some(hash_ring) => hash_ring.get(path).unwrap().address.clone(),
+        let group = match self.new_hash_ring().read().as_ref() {
+            Some(hash_ring) => {
+                Some(hash_ring.get(path).unwrap().group_id.clone())
+            }
+            None => None,
+        };
+        match group {
+            Some(group) => {
+                self.replica_manager().read().get_primary(&group).unwrap()
+            }
             None => self.get_address(path),
         }
     }
@@ -74,6 +85,12 @@ pub trait ClientStatusMonitor: InfoSyncer {
     async fn get_new_hash_ring_info(&self) -> Result<Vec<(String, usize)>, i32> {
         self.sender()
             .get_new_hash_ring_info(&self.manager_address().lock().await)
+            .await
+    }
+
+    async fn get_replica_sets_info(&self) -> Result<Vec<(String, Vec<(String, ServerStatus)>)>, i32> {
+        self.sender()
+            .get_groups_info(&self.manager_address().lock().await)
             .await
     }
 

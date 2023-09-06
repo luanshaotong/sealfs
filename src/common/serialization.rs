@@ -126,6 +126,7 @@ pub enum ManagerOperationType {
     RemoveNodes = 107,
     UpdateServerStatus = 108,
     FinishServer = 109,
+    GetGroups = 110,
 }
 
 impl TryFrom<u32> for ManagerOperationType {
@@ -140,6 +141,7 @@ impl TryFrom<u32> for ManagerOperationType {
             107 => Ok(ManagerOperationType::RemoveNodes),
             108 => Ok(ManagerOperationType::UpdateServerStatus),
             109 => Ok(ManagerOperationType::FinishServer),
+            110 => Ok(ManagerOperationType::GetGroups),
             _ => panic!("Unkown value: {}", value),
         }
     }
@@ -155,6 +157,7 @@ impl From<ManagerOperationType> for u32 {
             ManagerOperationType::RemoveNodes => 107,
             ManagerOperationType::UpdateServerStatus => 108,
             ManagerOperationType::FinishServer => 109,
+            ManagerOperationType::GetGroups => 110,
         }
     }
 }
@@ -169,46 +172,47 @@ impl ManagerOperationType {
             ManagerOperationType::RemoveNodes => 107u32.to_le_bytes(),
             ManagerOperationType::UpdateServerStatus => 108u32.to_le_bytes(),
             ManagerOperationType::FinishServer => 109u32.to_le_bytes(),
+            ManagerOperationType::GetGroups => 110u32.to_le_bytes(),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ServerType {
+pub enum GroupType {
     Running = 1,
     Add = 2,
     Remove = 3,
 }
 
-impl TryFrom<u32> for ServerType {
+impl TryFrom<u32> for GroupType {
     type Error = ();
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(ServerType::Running),
-            2 => Ok(ServerType::Add),
-            3 => Ok(ServerType::Remove),
+            1 => Ok(GroupType::Running),
+            2 => Ok(GroupType::Add),
+            3 => Ok(GroupType::Remove),
             _ => panic!("Unkown value: {}", value),
         }
     }
 }
 
-impl From<ServerType> for u32 {
-    fn from(value: ServerType) -> Self {
+impl From<GroupType> for u32 {
+    fn from(value: GroupType) -> Self {
         match value {
-            ServerType::Running => 1,
-            ServerType::Add => 2,
-            ServerType::Remove => 3,
+            GroupType::Running => 1,
+            GroupType::Add => 2,
+            GroupType::Remove => 3,
         }
     }
 }
 
-impl Display for ServerType {
+impl Display for GroupType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServerType::Running => write!(f, "Running"),
-            ServerType::Add => write!(f, "Add"),
-            ServerType::Remove => write!(f, "Remove"),
+            GroupType::Running => write!(f, "Running"),
+            GroupType::Add => write!(f, "Add"),
+            GroupType::Remove => write!(f, "Remove"),
         }
     }
 }
@@ -842,6 +846,11 @@ pub struct GetClusterStatusRecvMetaData {
 #[derive(Serialize, Deserialize, PartialEq)]
 pub struct GetHashRingInfoRecvMetaData {
     pub hash_ring_info: Vec<(String, usize)>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+pub struct GetGroupsRecvMetaData {
+    pub groups_info: Vec<(String, Vec<(String, ServerStatus)>)>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]

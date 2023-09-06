@@ -16,7 +16,7 @@ use crate::{
 use super::serialization::{
     AddNodesSendMetaData, ClusterStatus, CreateVolumeSendMetaData, DeleteNodesSendMetaData,
     GetClusterStatusRecvMetaData, GetHashRingInfoRecvMetaData, ManagerOperationType, OperationType,
-    Volume,
+    Volume, ServerStatus,
 };
 
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -272,6 +272,52 @@ impl Sender {
             }
             Err(e) => {
                 error!("get new hash ring info failed: {}", e);
+                Err(CONNECTION_ERROR)
+            }
+        }
+    }
+
+    pub async fn get_groups_info(
+        &self,
+        manager_address: &str,
+    ) -> Result<Vec<(String, Vec<(String, ServerStatus)>)>, i32> {
+        let mut status = 0i32;
+        let mut rsp_flags = 0u32;
+
+        let mut recv_meta_data = vec![0u8; 65535];
+
+        let mut recv_meta_data_length = 0usize;
+        let mut recv_data_length = 0usize;
+
+        let result = self
+            .client
+            .call_remote(
+                manager_address,
+                ManagerOperationType::GetGroups.into(),
+                0,
+                "",
+                &[],
+                &[],
+                &mut status,
+                &mut rsp_flags,
+                &mut recv_meta_data_length,
+                &mut recv_data_length,
+                &mut recv_meta_data,
+                &mut [],
+                CONTROLL_REQUEST_TIMEOUT,
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                if status != 0 {
+                    return Err(status);
+                }
+                let replica_sets_info: Vec<(String, Vec<(String, ServerStatus)>)> =
+                    bincode::deserialize(&recv_meta_data[..recv_meta_data_length]).unwrap();
+                Ok(replica_sets_info)
+            }
+            Err(e) => {
+                error!("get replica sets info failed: {}", e);
                 Err(CONNECTION_ERROR)
             }
         }

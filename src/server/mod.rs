@@ -82,7 +82,7 @@ pub async fn watch_status(engine: Arc<DistributedEngine<FileEngine>>) {
                 };
                 info!("watch status: get new hash ring info");
                 for value in all_servers_address.iter() {
-                    if engine.address == value.0
+                    if engine.group_id == value.0
                         || engine.hash_ring.read().as_ref().unwrap().contains(&value.0)
                     {
                         continue;
@@ -253,6 +253,7 @@ pub async fn watch_status(engine: Arc<DistributedEngine<FileEngine>>) {
 pub async fn run(
     database_path: String,
     storage_path: String,
+    group_id: String,
     server_address: String,
     manager_address: String,
     #[cfg(feature = "disk-db")] cache_capacity: usize,
@@ -271,6 +272,7 @@ pub async fn run(
     info!("Init: Storage Engine Init Finished");
 
     let engine = Arc::new(DistributedEngine::new(
+        group_id,
         server_address.clone(),
         storage_engine,
         meta_engine,
@@ -305,26 +307,36 @@ pub async fn run(
 
     info!("Init: Add connections and update Server Status");
 
-    let all_servers_address = match engine.get_hash_ring_info().await {
+    let hash_ring_info = match engine.get_hash_ring_info().await {
         Ok(value) => value,
         Err(_) => {
             panic!("Get Hash Ring Info Failed.");
         }
     };
-    info!("Init: Hash Ring Info: {:?}", all_servers_address);
-    for value in all_servers_address.iter() {
-        if server_address == value.0 {
-            continue;
+    info!("Init: Hash Ring Info: {:?}", hash_ring_info);
+
+    let groups_info = match engine.get_groups_info().await {
+        Ok(value) => value,
+        Err(_) => {
+            panic!("Get Groups Info Failed.");
         }
-        if let Err(e) = engine.add_connection(value.0.clone()).await {
-            panic!("Init: Add Connection Failed. Error = {}", e);
+    };
+
+    for value in groups_info.iter() {
+        for value in value.1.iter() {
+            if server_address == value.0 {
+                continue;
+            }
+            if let Err(e) = engine.add_connection(value.0.clone()).await {
+                panic!("Init: Add Connection Failed. Error = {}", e);
+            }
         }
     }
     info!("Init: Add Connections Success.");
     engine
         .hash_ring
         .write()
-        .replace(HashRing::new(all_servers_address));
+        .replace(HashRing::new(hash_ring_info));
     info!("Init: Update Hash Ring Success.");
 
     match <i32 as TryInto<ClusterStatus>>::try_into(engine.cluster_status.load(Ordering::Relaxed))
@@ -424,11 +436,11 @@ where
                 Ok((-1, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::Lookup => {
-                error!("{} Lookup not implemented", self.engine.address);
+                error!("{} Lookup not implemented", self.engine.group_id);
                 Ok((-1, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::CreateFile => {
-                debug!("{} Create File: path: {}", self.engine.address, file_path);
+                debug!("{} Create File: path: {}", self.engine.group_id, file_path);
                 let meta_data_unwraped: CreateFileSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
                 let (return_meta_data, status) = match self
@@ -465,7 +477,7 @@ where
                 ))
             }
             OperationType::CreateDir => {
-                debug!("{} Create Dir: path: {}", self.engine.address, file_path);
+                debug!("{} Create Dir: path: {}", self.engine.group_id, file_path);
                 let meta_data_unwraped: CreateDirSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
                 let (return_meta_data, status) = match self
@@ -497,7 +509,7 @@ where
                 ))
             }
             OperationType::GetFileAttr => {
-                debug!("{} Get File Attr: path: {}", self.engine.address, file_path);
+                debug!("{} Get File Attr: path: {}", self.engine.group_id, file_path);
                 let (return_meta_data, status) =
                     match self.engine.get_file_attr(file_path) {
                         Ok(value) => (value, 0),
@@ -519,7 +531,7 @@ where
                 ))
             }
             OperationType::OpenFile => {
-                debug!("{} Open File {}", self.engine.address, file_path);
+                debug!("{} Open File {}", self.engine.group_id, file_path);
                 let meta_data_unwraped: OpenFileSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
                 let status = match self.engine.open_file(
@@ -542,7 +554,7 @@ where
                 Ok((status, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::ReadDir => {
-                debug!("{} Read Dir: {}", self.engine.address, file_path);
+                debug!("{} Read Dir: {}", self.engine.group_id, file_path);
                 let md: ReadDirSendMetaData = bincode::deserialize(&metadata).unwrap();
                 let (data, status) = match self.engine.read_dir(file_path, md.size, md.offset) {
                     Ok(value) => (value, 0),
@@ -560,7 +572,7 @@ where
                 Ok((status, 0, 0, data.len(), Vec::new(), data))
             }
             OperationType::ReadFile => {
-                debug!("{} Read File: {}", self.engine.address, file_path);
+                debug!("{} Read File: {}", self.engine.group_id, file_path);
                 let md: ReadFileSendMetaData = bincode::deserialize(&metadata).unwrap();
                 let (data, status) = match self.engine.read_file(file_path, md.size, md.offset) {
                     Ok(value) => (value, 0),
@@ -578,7 +590,7 @@ where
                 Ok((status, 0, 0, data.len(), Vec::new(), data))
             }
             OperationType::WriteFile => {
-                debug!("{} Write File: {}", self.engine.address, file_path);
+                debug!("{} Write File: {}", self.engine.group_id, file_path);
                 let md: WriteFileSendMetaData = bincode::deserialize(&metadata).unwrap();
                 let (status, size) =
                     match self
@@ -607,7 +619,7 @@ where
                 ))
             }
             OperationType::DeleteFile => {
-                debug!("{} Delete File: {}", self.engine.address, file_path);
+                debug!("{} Delete File: {}", self.engine.group_id, file_path);
                 let meta_data_unwraped: DeleteFileSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
                 let status = match self
@@ -630,7 +642,7 @@ where
                 Ok((status, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::DeleteDir => {
-                debug!("{} Delete Dir: {}", self.engine.address, file_path);
+                debug!("{} Delete Dir: {}", self.engine.group_id, file_path);
                 let meta_data_unwraped: DeleteDirSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
                 let status = match self
@@ -653,7 +665,7 @@ where
                 Ok((status, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::DirectoryAddEntry => {
-                debug!("{} Directory Add Entry: {}", self.engine.address, file_path);
+                debug!("{} Directory Add Entry: {}", self.engine.group_id, file_path);
                 let md: DirectoryEntrySendMetaData = bincode::deserialize(&metadata).unwrap();
                 Ok((
                     self.engine
@@ -668,7 +680,7 @@ where
             OperationType::DirectoryDeleteEntry => {
                 debug!(
                     "{} Directory Delete Entry: {}",
-                    self.engine.address, file_path
+                    self.engine.group_id, file_path
                 );
                 let md: DirectoryEntrySendMetaData = bincode::deserialize(&metadata).unwrap();
                 Ok((
@@ -682,7 +694,7 @@ where
                 ))
             }
             OperationType::TruncateFile => {
-                debug!("{} Truncate File: {}", self.engine.address, file_path);
+                debug!("{} Truncate File: {}", self.engine.group_id, file_path);
                 let md: TruncateFileSendMetaData = bincode::deserialize(&metadata).unwrap();
                 let status =
                     match self.engine.truncate_file(file_path, md.length) {
@@ -698,7 +710,7 @@ where
                 Ok((status, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::CheckFile => {
-                info!("{} Checkout File: {}", self.engine.address, file_path);
+                info!("{} Checkout File: {}", self.engine.group_id, file_path);
                 let file_attr = bytes_as_file_attr(&metadata);
                 let status =
                     match self.engine.check_file(file_path, file_attr) {
@@ -714,7 +726,7 @@ where
                 Ok((status, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::CheckDir => {
-                info!("{} Checkout Dir: {}", self.engine.address, file_path);
+                info!("{} Checkout Dir: {}", self.engine.group_id, file_path);
                 let file_attr = bytes_as_file_attr(&metadata);
                 let status =
                     match self.engine.check_dir(file_path, file_attr) {
@@ -732,7 +744,7 @@ where
             OperationType::CreateDirNoParent => {
                 debug!(
                     "{} Create Dir no Parent: path: {}",
-                    self.engine.address, file_path
+                    self.engine.group_id, file_path
                 );
                 let meta_data_unwraped: CreateDirSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
@@ -764,7 +776,7 @@ where
             OperationType::CreateFileNoParent => {
                 debug!(
                     "{} Create File no Parent: path: {}",
-                    self.engine.address, file_path
+                    self.engine.group_id, file_path
                 );
                 let meta_data_unwraped: CreateFileSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
@@ -798,7 +810,7 @@ where
             OperationType::DeleteDirNoParent => {
                 debug!(
                     "{} Delete Dir no Parent: {}",
-                    self.engine.address, file_path
+                    self.engine.group_id, file_path
                 );
                 let status = match self.engine.delete_dir_no_parent(file_path) {
                     Ok(()) => 0,
@@ -818,7 +830,7 @@ where
             OperationType::DeleteFileNoParent => {
                 debug!(
                     "{} Delete File no Parent: {}",
-                    self.engine.address, file_path
+                    self.engine.group_id, file_path
                 );
                 let status = match self.engine.delete_file_no_parent(file_path) {
                     Ok(()) => 0,
@@ -836,7 +848,7 @@ where
                 Ok((status, 0, 0, 0, Vec::new(), Vec::new()))
             }
             OperationType::CreateVolume => {
-                info!("{} Create Volume", self.engine.address);
+                info!("{} Create Volume", self.engine.group_id);
                 let meta_data_unwraped: CreateVolumeSendMetaData =
                     bincode::deserialize(&metadata).unwrap();
                 info!("Create Volume: {:?}, id: {}", file_path, id);
@@ -868,10 +880,10 @@ where
             OperationType::InitVolume => {
                 info!(
                     "{} Init Volume: {}, id: {}",
-                    self.engine.address, file_path, id
+                    self.engine.group_id, file_path, id
                 );
                 if !file_path.is_empty()
-                    && self.engine.get_address(file_path) == self.engine.address
+                    && self.engine.get_address(file_path) == self.engine.group_id
                     && self.engine.meta_engine.init_volume(file_path).is_err()
                 {
                     error!(
@@ -879,7 +891,7 @@ where
                         id,
                         file_path,
                         self.engine.get_address(file_path),
-                        self.engine.address
+                        self.engine.group_id
                     );
                     return Ok((libc::ENOENT, 0, 0, 0, vec![], vec![]));
                 }
@@ -887,7 +899,7 @@ where
                 return Ok((0, 0, 0, 0, Vec::new(), Vec::new()));
             }
             OperationType::ListVolumes => {
-                info!("{} List Volume", self.engine.address);
+                info!("{} List Volume", self.engine.group_id);
                 let return_meta_data = self.engine.meta_engine.list_volumes().unwrap();
                 return Ok((
                     0,
@@ -899,7 +911,7 @@ where
                 ));
             }
             OperationType::DeleteVolume => {
-                info!("{} Delete Volume", self.engine.address);
+                info!("{} Delete Volume", self.engine.group_id);
                 info!("Delete Volume: {:?}, id: {}", file_path, id);
                 if file_path.is_empty()
                     || file_path.len() > 255
@@ -924,7 +936,7 @@ where
                 return Ok((status, 0, 0, 0, Vec::new(), Vec::new()));
             }
             OperationType::CleanVolume => {
-                info!("{} Clean Volume", self.engine.address);
+                info!("{} Clean Volume", self.engine.group_id);
                 info!("Clean Volume: {:?}, id: {}", file_path, id);
                 if file_path.is_empty()
                     || file_path.len() > 255

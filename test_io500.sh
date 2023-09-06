@@ -63,10 +63,10 @@ SEALFS_CONFIG_PATH=./examples ./target/debug/manager --log-level info &
 
 sleep 1
 
-for ((i=0; i<5; i++))
+for ((i=0; i<9; i++))
 do
-    port=$[8085+$i]
-    ./target/debug/server --server-address 127.0.0.1:${port} --database-path $1/database${i}/ --storage-path $1/storage${i}/ --log-level info &
+    port=$[8091+$i]
+    ./target/debug/server --group-id group$[i/3] --server-address 127.0.0.1:${port} --database-path $1/database${i}/ --storage-path $1/storage${i}/ --log-level info &
 done
 
 sleep 3

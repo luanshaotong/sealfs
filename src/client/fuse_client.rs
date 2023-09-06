@@ -5,6 +5,7 @@
 use crate::common::errors::CONNECTION_ERROR;
 use crate::common::hash_ring::HashRing;
 use crate::common::info_syncer::{ClientStatusMonitor, InfoSyncer};
+use crate::common::group_manager::GroupManager;
 use crate::common::sender::{Sender, REQUEST_TIMEOUT};
 use crate::common::serialization::{
     file_attr_as_bytes_mut, ClusterStatus, CreateDirSendMetaData, CreateFileSendMetaData,
@@ -47,6 +48,7 @@ pub struct Client {
     pub cluster_status: AtomicI32,
     pub hash_ring: Arc<RwLock<Option<HashRing>>>,
     pub new_hash_ring: Arc<RwLock<Option<HashRing>>>,
+    pub group_manager: Arc<RwLock<GroupManager>>,
     pub manager_address: Arc<tokio::sync::Mutex<String>>,
 }
 
@@ -92,6 +94,9 @@ impl ClientStatusMonitor for Client {
     fn new_hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>> {
         &self.new_hash_ring
     }
+    fn replica_manager(&self) -> &Arc<RwLock<GroupManager>> {
+        &self.group_manager
+    }
 }
 
 impl Client {
@@ -108,6 +113,7 @@ impl Client {
             cluster_status: AtomicI32::new(ClusterStatus::Initializing.into()),
             hash_ring: Arc::new(RwLock::new(None)),
             new_hash_ring: Arc::new(RwLock::new(None)),
+            group_manager: Arc::new(RwLock::new(GroupManager::new(vec![]))),
             manager_address: Arc::new(tokio::sync::Mutex::new("".to_string())),
         }
     }

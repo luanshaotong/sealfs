@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use crate::{
     common::serialization::{
         AddNodesSendMetaData, ClusterStatus, DeleteNodesSendMetaData, GetClusterStatusRecvMetaData,
-        GetHashRingInfoRecvMetaData, ManagerOperationType, ServerStatus,
+        GetHashRingInfoRecvMetaData, ManagerOperationType, ServerStatus, GetGroupsRecvMetaData,
     },
     rpc::server::Handler,
 };
@@ -16,27 +16,9 @@ use super::core::Manager;
 
 use async_trait::async_trait;
 use log::{debug, error, info};
-use serde::{Deserialize, Serialize};
 
 pub struct ManagerService {
     pub manager: Arc<Manager>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SendHeartRequest {
-    pub address: String,
-    pub flags: u32,
-    pub lifetime: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct MetadataRequest {
-    pub flags: u32,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-pub struct MetadataResponse {
-    pub instances: Vec<String>,
 }
 
 pub async fn update_server_status(manager: Arc<Manager>) {
@@ -166,8 +148,8 @@ pub async fn update_server_status(manager: Arc<Manager>) {
 }
 
 impl ManagerService {
-    pub fn new(servers: Vec<(String, usize)>) -> Self {
-        let manager = Arc::new(Manager::new(servers));
+    pub fn new(groups: Vec<(String, usize, Vec<String>)>) -> Self {
+        let manager = Arc::new(Manager::new(groups));
         ManagerService { manager }
     }
 }
@@ -276,6 +258,20 @@ impl Handler for ManagerService {
                         Ok((libc::EIO, 0, 0, 0, Vec::new(), Vec::new()))
                     }
                 }
+            }
+            ManagerOperationType::GetGroups => {
+                info!("connection {} get replica sets", id);
+                let groups_info = self.manager.get_groups_info();
+                let response_meta_data =
+                    bincode::serialize(&GetGroupsRecvMetaData { groups_info }).unwrap();
+                Ok((
+                    0,
+                    0,
+                    response_meta_data.len(),
+                    0,
+                    response_meta_data,
+                    Vec::new(),
+                ))
             }
             _ => todo!(),
         }

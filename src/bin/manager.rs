@@ -26,6 +26,8 @@ struct Args {
     #[arg(long)]
     log_level: Option<String>,
     #[arg(long)]
+    replicas: Option<usize>,
+    #[arg(long)]
     all_servers_address: Option<Vec<String>>,
     #[arg(long)]
     virtual_nodes: Option<usize>,
@@ -34,6 +36,7 @@ struct Args {
 #[derive(Debug, Serialize, Deserialize)]
 struct Properties {
     address: String,
+    replicas: usize,
     all_servers_address: Vec<String>,
     virtual_nodes: usize,
     log_level: String,
@@ -83,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         }
         false => Properties {
             address: args.address.unwrap_or(default_properties.address),
+            replicas: args.replicas.unwrap_or(default_properties.replicas),
             all_servers_address: args
                 .all_servers_address
                 .unwrap_or(default_properties.all_servers_address),
@@ -105,11 +109,16 @@ async fn main() -> anyhow::Result<()> {
 
     let address = properties.address;
 
-    let servers_address = properties
-        .all_servers_address
-        .iter()
-        .map(|s| (s.to_string(), properties.virtual_nodes))
-        .collect::<Vec<(String, usize)>>();
+    // split the addresses into groups by the number of replicas.
+    let mut servers_address = vec![];
+    let mut group = vec![];
+    for (i, server_address) in properties.all_servers_address.iter().enumerate() {
+        group.push(server_address.clone());
+        if (i + 1) % properties.replicas == 0 {
+            servers_address.push((format!("group{}", &(i/properties.replicas).to_string()), properties.virtual_nodes, group.clone()));
+            group.clear();
+        }
+    }
 
     info!("All servers address: {:?}", servers_address);
 

@@ -10,3 +10,4 @@ pub mod info_syncer;
 pub mod sender;
 pub mod serialization;
 pub mod util;
+pub mod group_manager;

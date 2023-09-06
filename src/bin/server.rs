@@ -18,6 +18,8 @@ struct Args {
     #[arg(long)]
     manager_address: Option<String>,
     #[arg(required = true, long)]
+    group_id: Option<String>,
+    #[arg(required = true, long)]
     server_address: Option<String>,
     #[arg(required = true, long)]
     database_path: Option<String>,
@@ -34,6 +36,7 @@ struct Args {
 #[derive(Debug, Serialize, Deserialize)]
 struct Properties {
     manager_address: String,
+    group_id: String,
     server_address: String,
     database_path: String,
     cache_capacity: usize,
@@ -49,6 +52,7 @@ async fn main() -> anyhow::Result<(), Box<dyn std::error::Error>> {
     // if the user provides the config file, parse it and use the arguments from the config file.
     let properties: Properties = Properties {
         manager_address: args.manager_address.unwrap_or("127.0.0.1:8081".to_owned()),
+        group_id: args.group_id.unwrap(),
         server_address: args.server_address.unwrap(),
         database_path: args.database_path.unwrap(),
         cache_capacity: args.cache_capacity.unwrap_or(13421772),
@@ -71,14 +75,12 @@ async fn main() -> anyhow::Result<(), Box<dyn std::error::Error>> {
 
     info!("start server with properties: {:?}", properties);
 
-    let manager_address = properties.manager_address;
-    let server_address = properties.server_address.clone();
-
     server::run(
         properties.database_path,
         properties.storage_path,
-        server_address,
-        manager_address,
+        properties.group_id,
+        properties.server_address,
+        properties.manager_address,
         properties.cache_capacity,
         properties.write_buffer_size,
     )

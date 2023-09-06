@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use async_trait::async_trait;
+use sealfs::common::group_manager::GroupManager;
 use sealfs::common::util::{empty_file, path_split};
 use spin::RwLock;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -43,6 +44,7 @@ pub struct Client {
 
     pub hash_ring: Arc<RwLock<Option<HashRing>>>,
     pub new_hash_ring: Arc<RwLock<Option<HashRing>>>,
+    pub replica_manager: Arc<RwLock<GroupManager>>,
     pub manager_address: Arc<tokio::sync::Mutex<String>>,
 }
 
@@ -93,6 +95,9 @@ impl ClientStatusMonitor for Client {
     fn new_hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>> {
         &self.new_hash_ring
     }
+    fn replica_manager(&self) -> &Arc<RwLock<GroupManager>> {
+        &self.replica_manager
+    }
 }
 
 impl Client {
@@ -108,6 +113,7 @@ impl Client {
             cluster_status: AtomicI32::new(ClusterStatus::Initializing.into()),
             hash_ring: Arc::new(RwLock::new(None)),
             new_hash_ring: Arc::new(RwLock::new(None)),
+            replica_manager: Arc::new(RwLock::new(GroupManager::new(vec![]))),
             manager_address: Arc::new(tokio::sync::Mutex::new("".to_string())),
         }
     }

@@ -7,75 +7,75 @@ use std::collections::HashMap;
 use conhash::{ConsistentHash, Node};
 
 #[derive(Clone)]
-pub struct ServerNode {
-    pub address: String,
+pub struct GroupNode {
+    pub group_id: String,
 }
 
-impl Node for ServerNode {
+impl Node for GroupNode {
     fn name(&self) -> String {
-        self.address.clone()
+        self.group_id.clone()
     }
 }
 
 pub struct HashRing {
-    pub ring: ConsistentHash<ServerNode>,
-    pub servers: HashMap<String, usize>,
+    pub ring: ConsistentHash<GroupNode>,
+    pub groups: HashMap<String, usize>,
 }
 
 impl Clone for HashRing {
     fn clone(&self) -> Self {
-        let servers = self.servers.clone();
-        let mut ring = ConsistentHash::<ServerNode>::new();
-        for (server, weight) in servers.iter() {
+        let groups = self.groups.clone();
+        let mut ring = ConsistentHash::<GroupNode>::new();
+        for (group, weight) in groups.iter() {
             ring.add(
-                &ServerNode {
-                    address: server.clone(),
+                &GroupNode {
+                    group_id: group.clone(),
                 },
                 *weight,
             );
         }
-        HashRing { ring, servers }
+        HashRing { ring, groups }
     }
 }
 
 impl HashRing {
-    pub fn new(servers: Vec<(String, usize)>) -> Self {
-        let mut ring = ConsistentHash::<ServerNode>::new();
-        let mut servers_map = HashMap::new();
-        for (server, weight) in servers {
+    pub fn new(groups: Vec<(String, usize)>) -> Self {
+        let mut ring = ConsistentHash::<GroupNode>::new();
+        let mut groups_map = HashMap::new();
+        for (group_id, weight) in groups {
             ring.add(
-                &ServerNode {
-                    address: server.clone(),
+                &GroupNode {
+                    group_id: group_id.clone(),
                 },
                 weight,
             );
-            servers_map.insert(server, weight);
+            groups_map.insert(group_id, weight);
         }
         HashRing {
             ring,
-            servers: servers_map,
+            groups: groups_map,
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<&ServerNode> {
+    pub fn get(&self, key: &str) -> Option<&GroupNode> {
         self.ring.get_str(key)
     }
 
-    pub fn add(&mut self, server: ServerNode, weight: usize) {
-        self.ring.add(&server, weight);
-        self.servers.insert(server.address, weight);
+    pub fn add(&mut self, group: GroupNode, weight: usize) {
+        self.ring.add(&group, weight);
+        self.groups.insert(group.group_id, weight);
     }
 
-    pub fn remove(&mut self, server: &ServerNode) {
-        self.ring.remove(server);
-        self.servers.remove(&server.address);
+    pub fn remove(&mut self, group: &GroupNode) {
+        self.ring.remove(group);
+        self.groups.remove(&group.group_id);
     }
 
-    pub fn contains(&self, server: &str) -> bool {
-        self.servers.contains_key(server)
+    pub fn contains(&self, group: &str) -> bool {
+        self.groups.contains_key(group)
     }
 
     pub fn get_server_lists(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+        self.groups.keys().cloned().collect()
     }
 }

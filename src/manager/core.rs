@@ -10,44 +10,53 @@ use anyhow::Error;
 use dashmap::DashMap;
 use log::{debug, info};
 
-use crate::common::hash_ring::{HashRing, ServerNode};
-use crate::common::serialization::{ClusterStatus, ServerStatus, ServerType};
+use crate::common::hash_ring::{HashRing, GroupNode};
+use crate::common::group_manager::{GroupManager, Server};
+use crate::common::serialization::{ClusterStatus, ServerStatus};
 pub struct Manager {
     pub hashring: Arc<RwLock<Option<HashRing>>>,
     pub new_hashring: Arc<RwLock<Option<HashRing>>>,
+    pub replica_manager: Arc<GroupManager>,
     pub servers: Arc<Mutex<HashMap<String, Server>>>,
     pub cluster_status: Arc<Mutex<ClusterStatus>>,
     pub closed: AtomicBool,
     _clients: DashMap<String, String>,
 }
 
-pub struct Server {
-    pub status: ServerStatus,
-    r#_type: ServerType,
-    _replicas: usize,
-}
-
 impl Manager {
-    pub fn new(servers: Vec<(String, usize)>) -> Self {
-        let hashring = Arc::new(RwLock::new(Some(HashRing::new(servers.clone()))));
+    pub fn new(groups: Vec<(String, usize, Vec<String>)>) -> Self {
+        let hashring = Arc::new(RwLock::new(Some(HashRing::new(groups.iter().map(|(group_id, weight, _)| (group_id.clone(), *weight)).collect()))));
+        let replica_sets = groups
+            .iter()
+            .map(|(group_id, _, servers)| {
+                (
+                    group_id.clone(),
+                    servers
+                        .iter()
+                        .map(|server| (server.clone(), ServerStatus::Initializing))
+                        .collect(),
+                )
+            })
+            .collect();
         let manager = Manager {
             hashring,
             new_hashring: Arc::new(RwLock::new(None)),
+            replica_manager: Arc::new(GroupManager::new(replica_sets)),
             servers: Arc::new(Mutex::new(HashMap::new())),
             cluster_status: Arc::new(Mutex::new(ClusterStatus::Initializing)),
             closed: AtomicBool::new(false),
             _clients: DashMap::new(),
         };
 
-        for (server, weight) in servers {
-            manager.servers.lock().unwrap().insert(
-                server,
-                Server {
-                    status: ServerStatus::Initializing,
-                    r#_type: ServerType::Running,
-                    _replicas: weight,
-                },
-            );
+        for (_, _, servers) in groups {
+            for server in servers {
+                manager.servers.lock().unwrap().insert(
+                    server,
+                    Server {
+                        status: ServerStatus::Initializing,
+                    },
+                );
+            }
         }
 
         manager
@@ -65,7 +74,7 @@ impl Manager {
             .unwrap()
             .as_ref()
             .unwrap()
-            .servers
+            .groups
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect()
@@ -74,13 +83,17 @@ impl Manager {
     pub fn get_new_hash_ring_info(&self) -> Result<Vec<(String, usize)>, Error> {
         if let Some(new_hashring) = self.new_hashring.read().unwrap().as_ref() {
             Ok(new_hashring
-                .servers
+                .groups
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect())
         } else {
             Err(anyhow::anyhow!("new hashring is none"))
         }
+    }
+
+    pub fn get_groups_info(&self) -> Vec<(String, Vec<(String, ServerStatus)>)> {
+        self.replica_manager.get_groups_info()
     }
 
     pub fn add_nodes(&self, nodes: Vec<(String, usize)>) -> Option<Error> {
@@ -93,8 +106,8 @@ impl Manager {
         let mut servers = self.servers.lock().unwrap();
         for (node, weight) in nodes {
             new_hashring.add(
-                ServerNode {
-                    address: node.clone(),
+                GroupNode {
+                    group_id: node.clone(),
                 },
                 weight,
             );
@@ -102,8 +115,6 @@ impl Manager {
                 node,
                 Server {
                     status: ServerStatus::Initializing,
-                    r#_type: ServerType::Running,
-                    _replicas: weight,
                 },
             );
         }
@@ -120,8 +131,8 @@ impl Manager {
             return Some(anyhow::anyhow!("cluster is not idle"));
         }
         let mut new_hashring = self.hashring.read().unwrap().clone().unwrap();
-        new_hashring.remove(&ServerNode {
-            address: nodes[0].clone(),
+        new_hashring.remove(&GroupNode {
+            group_id: nodes[0].clone(),
         });
 
         self.new_hashring.write().unwrap().replace(new_hashring);
