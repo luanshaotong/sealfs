@@ -3,285 +3,148 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
-use ahash::{HashMap, HashMapExt};
 use anyhow::Error;
 use dashmap::DashMap;
-use log::{debug, info};
-
-use crate::common::hash_ring::{HashRing, GroupNode};
-use crate::common::group_manager::{GroupManager, Server};
-use crate::common::serialization::{ClusterStatus, ServerStatus};
+use log::info;
+use crate::common::group_manager::{GroupsInfo, Group};
+use crate::common::serialization::{ClusterStatus, GroupStatus};
 pub struct Manager {
-    pub hashring: Arc<RwLock<Option<HashRing>>>,
-    pub new_hashring: Arc<RwLock<Option<HashRing>>>,
-    pub replica_manager: Arc<GroupManager>,
-    pub servers: Arc<Mutex<HashMap<String, Server>>>,
-    pub cluster_status: Arc<Mutex<ClusterStatus>>,
+    pub group_manager: Arc<Mutex<GroupsInfo>>,
     pub closed: AtomicBool,
     _clients: DashMap<String, String>,
 }
 
 impl Manager {
-    pub fn new(groups: Vec<(String, usize, Vec<String>)>) -> Self {
-        let hashring = Arc::new(RwLock::new(Some(HashRing::new(groups.iter().map(|(group_id, weight, _)| (group_id.clone(), *weight)).collect()))));
-        let replica_sets = groups
-            .iter()
-            .map(|(group_id, _, servers)| {
-                (
-                    group_id.clone(),
-                    servers
-                        .iter()
-                        .map(|server| (server.clone(), ServerStatus::Initializing))
-                        .collect(),
-                )
-            })
-            .collect();
-        let manager = Manager {
-            hashring,
-            new_hashring: Arc::new(RwLock::new(None)),
-            replica_manager: Arc::new(GroupManager::new(replica_sets)),
-            servers: Arc::new(Mutex::new(HashMap::new())),
-            cluster_status: Arc::new(Mutex::new(ClusterStatus::Initializing)),
+    pub fn new(groups: Vec<Group>) -> Self {
+        Self {
+            group_manager: Arc::new(Mutex::new(GroupsInfo::new(groups))),
             closed: AtomicBool::new(false),
             _clients: DashMap::new(),
-        };
-
-        for (_, _, servers) in groups {
-            for server in servers {
-                manager.servers.lock().unwrap().insert(
-                    server,
-                    Server {
-                        status: ServerStatus::Initializing,
-                    },
-                );
-            }
-        }
-
-        manager
-    }
-
-    pub fn get_cluster_status(&self) -> ClusterStatus {
-        let status = *self.cluster_status.lock().unwrap();
-        debug!("get_cluster_status: {:?}", status);
-        status
-    }
-
-    pub fn get_hash_ring_info(&self) -> Vec<(String, usize)> {
-        self.hashring
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .groups
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect()
-    }
-
-    pub fn get_new_hash_ring_info(&self) -> Result<Vec<(String, usize)>, Error> {
-        if let Some(new_hashring) = self.new_hashring.read().unwrap().as_ref() {
-            Ok(new_hashring
-                .groups
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect())
-        } else {
-            Err(anyhow::anyhow!("new hashring is none"))
         }
     }
 
-    pub fn get_groups_info(&self) -> Vec<(String, Vec<(String, ServerStatus)>)> {
-        self.replica_manager.get_groups_info()
-    }
+    pub fn set_group_status(&self, group_id: String, status: GroupStatus) -> Option<Error> {
 
-    pub fn add_nodes(&self, nodes: Vec<(String, usize)>) -> Option<Error> {
-        info!("add_nodes: {:?}", nodes);
-        let mut cluster_status = self.cluster_status.lock().unwrap();
-        if *cluster_status != ClusterStatus::Idle {
-            return Some(anyhow::anyhow!("cluster is not idle"));
-        }
-        let mut new_hashring = self.hashring.read().unwrap().clone().unwrap();
-        let mut servers = self.servers.lock().unwrap();
-        for (node, weight) in nodes {
-            new_hashring.add(
-                GroupNode {
-                    group_id: node.clone(),
-                },
-                weight,
-            );
-            servers.insert(
-                node,
-                Server {
-                    status: ServerStatus::Initializing,
-                },
-            );
-        }
-
-        self.new_hashring.write().unwrap().replace(new_hashring);
-        *cluster_status = ClusterStatus::NodesStarting;
-
-        None
-    }
-
-    pub fn delete_nodes(&self, nodes: Vec<String>) -> Option<Error> {
-        let mut cluster_status = self.cluster_status.lock().unwrap();
-        if *cluster_status != ClusterStatus::Idle {
-            return Some(anyhow::anyhow!("cluster is not idle"));
-        }
-        let mut new_hashring = self.hashring.read().unwrap().clone().unwrap();
-        new_hashring.remove(&GroupNode {
-            group_id: nodes[0].clone(),
-        });
-
-        self.new_hashring.write().unwrap().replace(new_hashring);
-
-        *cluster_status = ClusterStatus::NodesStarting;
-        None
-    }
-
-    pub fn set_server_status(&self, server_id: String, status: ServerStatus) -> Option<Error> {
-        // debug : logs all server_name in self.servers
-        debug!(
-            "set_server_status: {:?}",
-            self.servers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|kv| kv.0.clone())
-                .collect::<Vec<String>>()
-        );
-
-        info!("set server status: {} {:?}", server_id, status);
+        info!("set group status: {} {:?}", group_id, status);
 
         match status {
-            ServerStatus::Initializing => {
-                panic!("cannot set server status to init");
+            GroupStatus::Initializing => {
+                panic!("cannot set group status to init");
             }
-            ServerStatus::PreTransfer => {
-                let cluster_status = self.cluster_status.lock().unwrap();
-                if *cluster_status != ClusterStatus::SyncNewHashRing {
-                    return Some(anyhow::anyhow!("cannot pretransfer for server: {}, cluster is not SyncNewHashRing: status: {:?}" , server_id, *cluster_status));
+            GroupStatus::PreTransfer => {
+                let cluster_status = self.group_manager.lock().unwrap().get_cluster_status();
+                if cluster_status != <ClusterStatus as Into<i32>>::into(ClusterStatus::SyncNewHashRing) {
+                    return Some(anyhow::anyhow!("cannot pretransfer for group: {}, cluster is not SyncNewHashRing: status: {:?}" , group_id, cluster_status));
                 }
-                let mut servers = self.servers.lock().unwrap();
-                if servers.get(&server_id).unwrap().status != ServerStatus::Finished {
+                if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::Finished {
                     return Some(anyhow::anyhow!(
-                        "cannot pretransfer for server: {}, server is not finish: status: {:?}",
-                        server_id,
-                        servers.get(&server_id).unwrap().status
+                        "cannot pretransfer for group: {}, group is not finish: status: {:?}",
+                        group_id,
+                        self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
                     ));
                 }
-                servers.get_mut(&server_id).unwrap().status = ServerStatus::PreTransfer;
+                self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                 None
             }
-            ServerStatus::Transferring => {
-                let cluster_status = self.cluster_status.lock().unwrap();
-                if *cluster_status != ClusterStatus::PreTransfer {
+            GroupStatus::Transferring => {
+                let cluster_status = self.group_manager.lock().unwrap().get_cluster_status();
+                if cluster_status != <ClusterStatus as Into<i32>>::into(ClusterStatus::PreTransfer) {
+                    return Some(anyhow::anyhow!("cannot transfer for group: {}, cluster is not PreTransfer: status: {:?}" , group_id, cluster_status));
+                }
+                if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::PreTransfer {
                     return Some(anyhow::anyhow!(
-                        "cannot transfer for server: {}, cluster is not PreTransfer: status: {:?}",
-                        server_id,
-                        *cluster_status
+                        "cannot transfer for group: {}, group is not pretransfer: status: {:?}",
+                        group_id,
+                        self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
                     ));
                 }
-                let mut servers = self.servers.lock().unwrap();
-                if servers.get(&server_id).unwrap().status != ServerStatus::PreTransfer {
-                    return Some(anyhow::anyhow!(
-                        "cannot transfer for server: {}, server is not finish: status: {:?}",
-                        server_id,
-                        servers.get(&server_id).unwrap().status
-                    ));
-                }
-                servers.get_mut(&server_id).unwrap().status = ServerStatus::Transferring;
+                self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                 None
             }
-            ServerStatus::PreFinish => {
-                let cluster_status = self.cluster_status.lock().unwrap();
-                if *cluster_status != ClusterStatus::Transferring {
-                    return Some(anyhow::anyhow!("cannot prefinish for server: {}, cluster is not Transferring: status: {:?}" , server_id, *cluster_status));
+            GroupStatus::PreFinish => {
+                let cluster_status = self.group_manager.lock().unwrap().get_cluster_status();
+                if cluster_status != <ClusterStatus as Into<i32>>::into(ClusterStatus::Transferring) {
+                    return Some(anyhow::anyhow!("cannot prefinish for group: {}, cluster is not Transferring: status: {:?}" , group_id, cluster_status));
                 }
-                let mut servers = self.servers.lock().unwrap();
-                if servers.get(&server_id).unwrap().status != ServerStatus::Transferring {
+                if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::Transferring {
                     return Some(anyhow::anyhow!(
-                        "cannot prefinish for server: {}, server is not transferring: status: {:?}",
-                        server_id,
-                        servers.get(&server_id).unwrap().status
+                        "cannot prefinish for group: {}, group is not transferring: status: {:?}",
+                        group_id,
+                        self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
                     ));
                 }
-                servers.get_mut(&server_id).unwrap().status = ServerStatus::PreFinish;
+                self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                 None
             }
-            ServerStatus::Finishing => {
-                let cluster_status = self.cluster_status.lock().unwrap();
-                if *cluster_status != ClusterStatus::PreFinish {
-                    return Some(anyhow::anyhow!("cannot prefinish for server: {}, cluster is not Transferring: status: {:?}" , server_id, *cluster_status));
+            GroupStatus::Finishing => {
+                let cluster_status = self.group_manager.lock().unwrap().get_cluster_status();
+                if cluster_status != <ClusterStatus as Into<i32>>::into(ClusterStatus::PreFinish) {
+                    return Some(anyhow::anyhow!("cannot finish for group: {}, cluster is not PreFinish: status: {:?}" , group_id, cluster_status));
                 }
-                let mut servers: std::sync::MutexGuard<
-                    std::collections::HashMap<String, Server, ahash::RandomState>,
-                > = self.servers.lock().unwrap();
-                if servers.get(&server_id).unwrap().status != ServerStatus::PreFinish {
+                if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::PreFinish {
                     return Some(anyhow::anyhow!(
-                        "cannot finish for server: {}, server is not prefinish: status: {:?}",
-                        server_id,
-                        servers.get(&server_id).unwrap().status
+                        "cannot finish for group: {}, group is not prefinish: status: {:?}",
+                        group_id,
+                        self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
                     ));
                 }
-                servers.get_mut(&server_id).unwrap().status = ServerStatus::Finishing;
+                self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                 None
             }
-            ServerStatus::Finished => {
-                let cluster_status = self.cluster_status.lock().unwrap();
-                match *cluster_status {
+            GroupStatus::Finished => {
+                let cluster_status = self.group_manager.lock().unwrap().get_cluster_status();
+                match cluster_status.try_into().unwrap() {
                     ClusterStatus::Finishing => {
-                        let mut servers: std::sync::MutexGuard<std::collections::HashMap<String, Server, ahash::RandomState>> = self.servers.lock().unwrap();
-                        if servers.get(&server_id).unwrap().status != ServerStatus::Finishing {
-                            return Some(anyhow::anyhow!("cannot finish for server: {}, server is not Finishing: status: {:?}", server_id, servers.get(&server_id).unwrap().status));
+                        if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::Finishing {
+                            return Some(anyhow::anyhow!(
+                                "cannot finish for group: {}, group is not finishing: status: {:?}",
+                                group_id,
+                                self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
+                            ));
                         }
-                        servers.get_mut(&server_id).unwrap().status = ServerStatus::Finished;
+                        self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                         None
                     }
                     ClusterStatus::Initializing => {
-                        let mut servers = self.servers.lock().unwrap();
-                        if servers.get(&server_id).unwrap().status != ServerStatus::Initializing {
+                        if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::Initializing {
                             return Some(anyhow::anyhow!(
-                                "cannot finish for server: {}, server is not Initializing: status: {:?}",
-                                server_id,
-                                servers.get(&server_id).unwrap().status
+                                "cannot finish for group: {}, group is not initializing: status: {:?}",
+                                group_id,
+                                self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
                             ));
                         }
-                        servers.get_mut(&server_id).unwrap().status = ServerStatus::Finished;
+                        self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                         None
                     }
                     ClusterStatus::NodesStarting => {
-                        let mut servers = self.servers.lock().unwrap();
                         if !self
-                            .new_hashring
-                            .read()
+                            .group_manager
+                            .lock()
                             .unwrap()
-                            .as_ref()
-                            .unwrap()
-                            .contains(&server_id)
+                            .if_group_in_new_hash_ring(&group_id)
                         {
                             return Some(anyhow::anyhow!(
-                                "cannot finish for server: {}, server is not in new_hashring",
-                                server_id
+                                "cannot finish for group: {}, group is not in new_hashring",
+                                group_id
                             ));
                         }
-                        if servers.get(&server_id).unwrap().status != ServerStatus::Initializing {
+                        if self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap() != GroupStatus::Initializing {
                             return Some(anyhow::anyhow!(
-                                "cannot finish for server: {}, server is not Initializing: status: {:?}",
-                                server_id,
-                                servers.get(&server_id).unwrap().status
+                                "cannot finish for group: {}, group is not initializing: status: {:?}",
+                                group_id,
+                                self.group_manager.lock().unwrap().get_group_status(&group_id).unwrap()
                             ));
                         }
-                        servers.get_mut(&server_id).unwrap().status = ServerStatus::Finished;
+                        self.group_manager.lock().unwrap().set_group_status(&group_id, status);
                         None
                     }
                     _ => {
                         Some(anyhow::anyhow!(
-                            "cannot finish for server: {}, cluster is not Finishing, Init or AddNodes: status: {:?}",
-                            server_id,
-                            *cluster_status
+                            "cannot finish for group: {}, cluster is not Finishing, Init or AddNodes: status: {:?}",
+                            group_id,
+                            cluster_status
                         ))
                     }
                 }

@@ -15,8 +15,7 @@ use log::{error, info, warn};
 use crate::{
     common::{
         errors::{status_to_string, CONNECTION_ERROR},
-        sender::REQUEST_TIMEOUT,
-        serialization::MountVolumeSendMetaData,
+        serialization::MountVolumeSendMetaData, group_manager::sender::REQUEST_TIMEOUT,
     },
     rpc::{
         client::{RpcClient, UnixStreamCreator},
@@ -24,14 +23,14 @@ use crate::{
     },
 };
 
-use super::{fuse_client::Client, SealFS};
+use super::{fuse_client::FSClient, SealFS};
 const MOUNT: u32 = 1;
 const PROBE: u32 = 2;
 const UMOUNT: u32 = 3;
 const LIST_MOUNTPOINTS: u32 = 4;
 
 pub struct SealfsFused {
-    pub client: Arc<Client>,
+    pub client: Arc<FSClient>,
     pub mount_points: DashMap<String, (String, bool, BackgroundSession)>,
     pub index_file: String,
     pub mount_lock: tokio::sync::Mutex<()>,
@@ -44,7 +43,7 @@ unsafe impl Sync for SealfsFused {}
 unsafe impl Send for SealfsFused {}
 
 impl SealfsFused {
-    pub fn new(index_file: String, client: Arc<Client>) -> Self {
+    pub fn new(index_file: String, client: Arc<FSClient>) -> Self {
         Self {
             client,
             mount_points: DashMap::new(),

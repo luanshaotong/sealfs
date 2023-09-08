@@ -12,8 +12,9 @@ use spin::RwLock;
 use tokio::time::sleep;
 
 use crate::common::errors::{self, status_to_string, CONNECTION_ERROR};
+use super::hash_ring::HashRing;
 
-use super::{hash_ring::HashRing, sender::Sender, serialization::{ClusterStatus, ServerStatus}, group_manager::GroupManager};
+use crate::common::{sender::Sender, serialization::{ClusterStatus, GroupStatus}, group_manager::group::GroupManager};
 
 #[async_trait]
 pub trait InfoSyncer {
@@ -33,7 +34,7 @@ async fn sync_cluster_infos<I: InfoSyncer>(client: Arc<I>) {
                     }
                 }
                 Err(e) => {
-                    info!("sync server infos failed, error = {}", e);
+                    info!("sync cluster infos failed, error = {}", e);
                 }
             }
         }
@@ -45,12 +46,12 @@ async fn sync_cluster_infos<I: InfoSyncer>(client: Arc<I>) {
 pub trait ClientStatusMonitor: InfoSyncer {
     fn hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>>;
     fn new_hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>>;
-    fn replica_manager(&self) -> &Arc<RwLock<GroupManager>>;
+    fn group_manager(&self) -> &Arc<RwLock<GroupManager>>;
     fn sender(&self) -> &Sender;
     fn manager_address(&self) -> &Arc<tokio::sync::Mutex<String>>;
 
     fn get_address(&self, path: &str) -> String {
-        self.replica_manager().read().get_primary(
+        self.group_manager().read().get_primary(
          &self.hash_ring()
             .read()
             .as_ref()
@@ -71,7 +72,7 @@ pub trait ClientStatusMonitor: InfoSyncer {
         };
         match group {
             Some(group) => {
-                self.replica_manager().read().get_primary(&group).unwrap()
+                self.group_manager().read().get_primary(&group).unwrap()
             }
             None => self.get_address(path),
         }
@@ -88,7 +89,7 @@ pub trait ClientStatusMonitor: InfoSyncer {
             .await
     }
 
-    async fn get_replica_sets_info(&self) -> Result<Vec<(String, Vec<(String, ServerStatus)>)>, i32> {
+    async fn get_replica_sets_info(&self) -> Result<Vec<(String, GroupStatus, Vec<String>)>, i32> {
         self.sender()
             .get_groups_info(&self.manager_address().lock().await)
             .await
@@ -130,16 +131,16 @@ pub trait ClientStatusMonitor: InfoSyncer {
         })
     }
 
-    async fn add_new_servers(&self, new_servers_info: Vec<(String, usize)>) -> Result<(), i32> {
+    async fn add_new_groups(&self, new_groups_info: Vec<(String, usize, Vec<String>)>) -> Result<(), i32> {
         self.sender()
-            .add_new_servers(&self.manager_address().lock().await, new_servers_info)
+            .add_new_groups(&self.manager_address().lock().await, new_groups_info)
             .await
     }
 
     async fn connect_servers(&self) -> Result<(), i32> {
         debug!("init");
 
-        let result = async {
+        let all_servers_address = async {
             loop {
                 match self
                     .cluster_status()
@@ -165,20 +166,24 @@ pub trait ClientStatusMonitor: InfoSyncer {
                 }
             }
         }
-        .await;
+        .await?;
 
-        match result {
-            Ok(all_servers_address) => {
-                for server_address in &all_servers_address {
-                    self.add_connection(&server_address.0).await?;
+        let groups_info = self.get_replica_sets_info().await?;
+        for value in groups_info.iter() {
+            for value in value.2.iter() {
+                if let Err(e) = self.add_connection(value).await {
+                    panic!("Init: Add Connection Failed. Error = {}", e);  // TODO: should mark and skip the failed server
                 }
-                self.hash_ring()
-                    .write()
-                    .replace(HashRing::new(all_servers_address.clone()));
-                Ok(())
             }
-            Err(e) => Err(e),
         }
+        
+        self.hash_ring()
+            .write()
+            .replace(HashRing::new(all_servers_address.clone()));
+        self.group_manager()
+            .write()
+            .sync(groups_info);
+        Ok(())
     }
 }
 
@@ -344,6 +349,28 @@ pub async fn init_network_connections<
     if let Err(e) = client.connect_to_manager(&manager_address).await {
         panic!("connect to manager failed, err = {}", status_to_string(e));
     }
+    tokio::spawn(sync_cluster_infos(client.clone()));
+    tokio::spawn(client_watch_status(client));
+}
+
+pub async fn init_network_connections_with_servers<
+    I: ClientStatusMonitor + std::marker::Sync + std::marker::Send + 'static,
+>(
+    manager_address: String,
+    client: Arc<I>,
+) {
+    if let Err(e) = client.connect_to_manager(&manager_address).await {
+        panic!("connect to manager failed, err = {}", status_to_string(e));
+    }
+    
+    info!("connect_servers");
+    if let Err(status) = client.connect_servers().await {
+        panic!(
+            "connect_servers failed, status = {:?}",
+            status_to_string(status)
+        );
+    }
+
     tokio::spawn(sync_cluster_infos(client.clone()));
     tokio::spawn(client_watch_status(client));
 }

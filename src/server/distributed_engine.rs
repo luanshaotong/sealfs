@@ -1,14 +1,14 @@
+use super::connector::ServerClusterManager;
 use super::storage_engine::meta_engine::MetaEngine;
 use super::storage_engine::StorageEngine;
 use super::transfer_manager::TransferManager;
 use crate::common::byte::CHUNK_SIZE;
 use crate::common::errors::CONNECTION_ERROR;
-use crate::common::hash_ring::HashRing;
-use crate::common::group_manager::GroupManager;
-use crate::common::sender::{Sender, REQUEST_TIMEOUT};
+use crate::common::group_manager::GroupsInfo;
+use crate::common::group_manager::sender::{Sender, REQUEST_TIMEOUT};
 use crate::common::serialization::{
     file_attr_as_bytes, ClusterStatus, CreateDirSendMetaData, CreateFileSendMetaData,
-    FileTypeSimple, ManagerOperationType, ReadFileSendMetaData, ServerStatus,
+    FileTypeSimple, ManagerOperationType, ReadFileSendMetaData, GroupStatus,
     WriteFileSendMetaData,
 };
 use crate::common::serialization::{DirectoryEntrySendMetaData, OperationType};
@@ -22,10 +22,7 @@ use libc::{O_CREAT, O_DIRECTORY, O_EXCL};
 use log::{debug, error, info};
 use nix::fcntl::OFlag;
 use rocksdb::IteratorMode;
-use spin::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::{sync::Arc, vec};
-use tokio::sync::Mutex;
 
 pub struct DistributedEngine<Storage: StorageEngine> {
     pub group_id: String,
@@ -41,20 +38,10 @@ pub struct DistributedEngine<Storage: StorageEngine> {
     >,
     pub sender: Sender,
 
-    pub cluster_status: AtomicI32,
-
-    pub hash_ring: Arc<RwLock<Option<HashRing>>>,
-    pub new_hash_ring: Arc<RwLock<Option<HashRing>>>,
-    pub group_manager: Arc<RwLock<GroupManager>>,
-
-    pub manager_address: Arc<Mutex<String>>,
+    pub cluster_manager: Arc<ServerClusterManager>,
 
     pub file_locks: DashMap<String, DashMap<String, u32>>,
     pub transfer_manager: TransferManager,
-
-    pub closed: AtomicBool,
-
-    pub node_role: AtomicI32,
 }
 
 impl<Storage> DistributedEngine<Storage>
@@ -72,27 +59,22 @@ where
             file_locks.insert(kv.key().to_owned(), DashMap::new());
         }
         let client = Arc::new(RpcClient::new());
+        let group_manager = Arc::new(GroupsInfo::new(vec![]));
         Self {
             group_id,
             server_address,
             storage_engine,
             meta_engine,
             client: client.clone(),
-            sender: Sender::new(client),
-            cluster_status: AtomicI32::new(ClusterStatus::Unkown.into()),
-            hash_ring: Arc::new(RwLock::new(None)),
-            new_hash_ring: Arc::new(RwLock::new(None)),
-            group_manager: Arc::new(RwLock::new(GroupManager::new(vec![]))),
-            manager_address: Arc::new(Mutex::new("".to_string())),
+            sender: Sender::new(client, group_manager.clone()),
+            cluster_manager: group_manager,
             file_locks,
             transfer_manager: TransferManager::new(),
-            closed: AtomicBool::new(false),
-            node_role: AtomicI32::new(0),
         }
     }
 
-    pub async fn add_connection(&self, address: String) -> Result<(), i32> {
-        self.client.add_connection(&address).await.map_err(|e| {
+    pub async fn add_connection(&self, address: &str) -> Result<(), i32> {
+        self.client.add_connection(address).await.map_err(|e| {
             error!("add connection failed: {:?}", e);
             CONNECTION_ERROR
         })
@@ -111,7 +93,7 @@ where
         }
     }
 
-    // pub fn lock_file_mut(
+    // pub fn lock_file_mut(                                              
     //     &self,
     //     path: &str,
     // ) -> Result<RefMut<String, HashMap<std::string::String, u32>>, i32> {
@@ -389,223 +371,8 @@ where
         self.client.remove_connection(&address);
     }
 
-    pub fn get_address(&self, path: &str) -> String {
-        self.hash_ring
-            .read()
-            .as_ref()
-            .unwrap()
-            .get(path)
-            .unwrap()
-            .group_id
-            .clone()
-    }
-
-    pub fn get_new_address(&self, path: &str) -> String {
-        match self.new_hash_ring.read().as_ref() {
-            Some(ring) => ring.get(path).unwrap().group_id.clone(),
-            None => self.get_address(path),
-        }
-    }
-
     pub async fn rlock_in_transfer_map(&self, path: &str) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.transfer_manager.get_rlock(path).await
-    }
-
-    pub fn get_server_address(&self, path: &str) -> (String, bool) {
-        let cluster_status = self.cluster_status.load(Ordering::Acquire);
-
-        // check the ClusterStatus is not Idle
-        // for efficiency, we use i32 operation to check the ClusterStatus
-        if cluster_status == 301 {
-            return (self.get_address(path), false);
-        }
-
-        match cluster_status.try_into().unwrap() {
-            ClusterStatus::Initializing => todo!(),
-            ClusterStatus::Idle => todo!(),
-            ClusterStatus::NodesStarting => (self.get_address(path), false),
-            ClusterStatus::SyncNewHashRing => (self.get_address(path), false),
-            ClusterStatus::PreTransfer => {
-                let address = self.get_address(path);
-                if address != self.group_id {
-                    (address, false)
-                } else {
-                    let new_address = self.get_new_address(path);
-                    if new_address != self.group_id {
-                        // the most efficient way is to check the operation_type
-                        // if operation_type is Create, forward the request to the new node
-                        // here is a temporary solution
-                        match self.meta_engine.is_exist(path) {
-                            Ok(true) => (address, false),
-                            Ok(false) => (new_address, false),
-                            Err(e) => {
-                                error!("get forward address failed, error: {}", e);
-                                (new_address, false) // local db error, attempt to forward. but it may cause inconsistency
-                            }
-                        }
-                    } else {
-                        (address, false)
-                    }
-                }
-            }
-            ClusterStatus::Transferring => {
-                let address = self.get_address(path);
-                if address != self.group_id {
-                    (address, false)
-                } else {
-                    let new_address = self.get_new_address(path);
-                    if new_address != self.group_id {
-                        match self.transfer_manager.status(path) {
-                            Some(true) => (new_address, false),
-                            Some(false) => (address, false),
-                            None => (new_address, false),
-                        }
-                    } else {
-                        (address, false)
-                    }
-                }
-            }
-            ClusterStatus::PreFinish => {
-                let address = self.get_address(path);
-                if address != self.group_id {
-                    (address, false)
-                } else {
-                    let new_address = self.get_new_address(path);
-                    if new_address != self.group_id {
-                        (new_address, false)
-                    } else {
-                        (address, false)
-                    }
-                }
-            }
-            ClusterStatus::Finishing => (self.get_address(path), false),
-            ClusterStatus::StatusError => todo!(),
-            ClusterStatus::Unkown => todo!(),
-            //s => panic!("get forward address failed, invalid cluster status: {}", s),
-        }
-    }
-
-    pub fn get_forward_address(&self, path: &str) -> (Option<String>, bool) {
-        let cluster_status = self.cluster_status.load(Ordering::Acquire);
-
-        // check the ClusterStatus is not Idle
-        // for efficiency, we use i32 operation to check the ClusterStatus
-        if cluster_status == 301 {
-            // assert!(self.address == self.get_address(path));
-            return (None, false);
-        }
-
-        match cluster_status.try_into().unwrap() {
-            ClusterStatus::NodesStarting => (None, false),
-            ClusterStatus::SyncNewHashRing => (None, false),
-            ClusterStatus::PreTransfer => {
-                let address = self.get_new_address(path);
-                if address != self.group_id {
-                    // the most efficient way is to check the operation_type
-                    // if operation_type is Create, forward the request to the new node
-                    // here is a temporary solution
-                    match self.meta_engine.is_exist(path) {
-                        Ok(true) => (None, false),
-                        Ok(false) => (Some(address), false),
-                        Err(e) => {
-                            error!("get forward address failed, error: {}", e);
-                            (Some(address), false) // local db error, attempt to forward. but it may cause inconsistency
-                        }
-                    }
-                } else {
-                    (None, false)
-                }
-            }
-            ClusterStatus::Transferring => {
-                let address = self.get_new_address(path);
-                if address != self.group_id {
-                    match self.transfer_manager.status(path) {
-                        Some(true) => (Some(address), false),
-                        Some(false) => (None, false),
-                        None => (Some(address), false),
-                    }
-                } else {
-                    (None, false)
-                }
-            }
-            ClusterStatus::PreFinish => {
-                let address = self.get_new_address(path);
-                if address != self.group_id {
-                    (Some(address), false)
-                } else {
-                    (None, false)
-                }
-            }
-            ClusterStatus::Finishing => (None, false),
-            ClusterStatus::Initializing => (None, false),
-            s => panic!("get forward address failed, invalid cluster status: {}", s),
-        }
-    }
-
-    pub async fn update_server_status(&self, server_status: ServerStatus) -> Result<(), i32> {
-        let send_meta_data = bincode::serialize(&server_status).unwrap();
-
-        let mut status = 0i32;
-        let mut rsp_flags = 0u32;
-
-        let mut recv_meta_data_length = 0usize;
-        let mut recv_data_length = 0usize;
-
-        let result = self
-            .client
-            .call_remote(
-                &self.manager_address.lock().await,
-                ManagerOperationType::UpdateServerStatus.into(),
-                0,
-                &self.group_id,
-                &send_meta_data,
-                &[],
-                &mut status,
-                &mut rsp_flags,
-                &mut recv_meta_data_length,
-                &mut recv_data_length,
-                &mut [],
-                &mut [],
-                REQUEST_TIMEOUT,
-            )
-            .await;
-        match result {
-            Ok(_) => {
-                if status != 0 {
-                    Err(status)
-                } else {
-                    Ok(())
-                }
-            }
-            Err(e) => {
-                error!("update server status failed, error: {}", e);
-                Err(CONNECTION_ERROR)
-            }
-        }
-    }
-
-    pub async fn get_cluster_status(&self) -> Result<ClusterStatus, i32> {
-        self.sender
-            .get_cluster_status(&self.manager_address.lock().await)
-            .await
-    }
-
-    pub async fn get_hash_ring_info(&self) -> Result<Vec<(String, usize)>, i32> {
-        self.sender
-            .get_hash_ring_info(&self.manager_address.lock().await)
-            .await
-    }
-
-    pub async fn get_new_hash_ring_info(&self) -> Result<Vec<(String, usize)>, i32> {
-        self.sender
-            .get_new_hash_ring_info(&self.manager_address.lock().await)
-            .await
-    }
-
-    pub async fn get_groups_info(&self) -> Result<Vec<(String, Vec<(String, ServerStatus)>)>, i32> {
-        self.sender
-            .get_groups_info(&self.manager_address.lock().await)
-            .await
     }
 
     #[inline]
@@ -662,6 +429,7 @@ where
             OperationType::ListVolumes => (0, 0, 0, 0, vec![], vec![]),
             OperationType::DeleteVolume => (0, 0, 0, 0, vec![], vec![]),
             OperationType::CleanVolume => (0, 0, 0, 0, vec![], vec![]),
+            OperationType::ServerIsPrimary => todo!(),
         };
         let result = self
             .client

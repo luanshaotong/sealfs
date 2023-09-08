@@ -6,18 +6,17 @@
 
 use std::{sync::Arc, time::Duration};
 
-use log::error;
+use log::{error, debug};
 
 use crate::{
-    common::errors::CONNECTION_ERROR,
+    common::{errors::CONNECTION_ERROR, serialization::{AddGroupsSendMetaData, CreateVolumeSendMetaData, DeleteGroupsSendMetaData,
+        GetClusterStatusRecvMetaData, GetHashRingInfoRecvMetaData, ManagerOperationType, OperationType,
+        Volume,
+    }},
     rpc::client::{RpcClient, TcpStreamCreator},
 };
 
-use super::serialization::{
-    AddNodesSendMetaData, ClusterStatus, CreateVolumeSendMetaData, DeleteNodesSendMetaData,
-    GetClusterStatusRecvMetaData, GetHashRingInfoRecvMetaData, ManagerOperationType, OperationType,
-    Volume, ServerStatus,
-};
+use super::{ errors::{SERVER_IS_NOT_LEADER, self}, Group, GroupsInfo};
 
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONTROLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -30,6 +29,7 @@ pub struct Sender {
             TcpStreamCreator,
         >,
     >,
+    pub group_manager: Arc<GroupsInfo>,
 }
 
 impl Sender {
@@ -41,20 +41,156 @@ impl Sender {
                 TcpStreamCreator,
             >,
         >,
+        group_manager: Arc<GroupsInfo>,
     ) -> Self {
-        Sender { client }
+        Sender { client , group_manager}
     }
 
-    pub async fn add_new_servers(
+    pub async fn server_is_primary(&self, address: &str) -> Result<bool, i32> {
+        let mut status = 0i32;
+        let mut rsp_flags = 0u32;
+
+        let mut recv_meta_data_length = 0usize;
+        let mut recv_data_length = 0usize;
+
+        let result = self
+             .client
+             .call_remote(
+                address,
+                OperationType::ServerIsPrimary.into(),
+                0,
+                "",
+                &[],
+                &[],
+                &mut status,
+                &mut rsp_flags,
+                &mut recv_meta_data_length,
+                &mut recv_data_length,
+                &mut [],
+                &mut [],
+                CONTROLL_REQUEST_TIMEOUT,
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                if status == SERVER_IS_NOT_LEADER {
+                    Ok(false)
+                } else if status != 0 {
+                    Err(status)
+                } else {
+                    Ok(true)
+                }
+            }
+            Err(e) => {
+                error!("server is primary failed: {}", e);
+                Err(CONNECTION_ERROR)
+            }
+        }
+    }
+
+    pub async fn swap_primary_server(
+        &self,
+        group_id: &str,
+        last_primary_server_address: &str,
+    ) -> Result<(), i32> {
+        if last_primary_server_address != self
+            .group_manager
+            .get_primary_server_in_group(group_id)
+            .unwrap()
+        {
+            return Err(errors::SERVER_IS_NOT_LEADER);
+        };
+        for server in self.group_manager.get_group_servers(group_id).unwrap() {
+            match self.server_is_primary(&server.server_address).await {
+                Ok(true) => {
+                    if let Some(e) = self.group_manager
+                        .set_primary_server_in_group(group_id, server.server_address) {
+                        error!("set primary server in group failed: {}", e);
+                        return Err(errors::GROUP_MANAGER_ERROR);
+                    }
+                    return Ok(());
+                }
+                Ok(false) => continue,
+                Err(_) => todo!(),
+            }
+        }
+        Err(errors::SERVER_IS_NOT_LEADER)
+    }
+
+    pub async fn call_remote_by_group(
+        &self,
+        group_id: &str,
+        operation_type: u32,
+        req_flags: u32,
+        path: &str,
+        send_meta_data: &[u8],
+        send_data: &[u8],
+        status: &mut i32,
+        rsp_flags: &mut u32,
+        recv_meta_data_length: &mut usize,
+        recv_data_length: &mut usize,
+        recv_meta_data: &mut [u8],
+        recv_data: &mut [u8],
+        timeout: Duration,
+    ) -> Result<(), i32> {
+        loop {
+            let address = self.group_manager.get_primary_server_in_group(group_id).unwrap();
+            let result = self
+                .client
+                .call_remote(
+                    &address,
+                    operation_type.into(),
+                    req_flags,
+                    path,
+                    send_meta_data,
+                    send_data,
+                    status,
+                    rsp_flags,
+                    recv_meta_data_length,
+                    recv_data_length,
+                    recv_meta_data,
+                    recv_data,
+                    timeout,
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    if status == &SERVER_IS_NOT_LEADER {
+                        debug!("{} is not leader, try to get new primary", &address);
+                        loop {
+                            if let Err(e) = self.swap_primary_server(group_id, &address).await {
+                                if e != SERVER_IS_NOT_LEADER {
+                                    return Err(e);
+                                }
+                                // new primary server is not ready, wait for a while
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            } else {
+                                // get new primary server
+                                break;
+                            }
+                        } 
+                    } else {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    error!("call remote failed: {}", e);
+                    return Err(CONNECTION_ERROR);
+                }
+            }
+        }
+    }
+
+    pub async fn add_new_groups(
         &self,
         manager_address: &str,
-        new_servers_info: Vec<(String, usize)>,
+        new_groups_info: Vec<Group>,
     ) -> Result<(), i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
         let send_meta_data =
-            bincode::serialize(&AddNodesSendMetaData { new_servers_info }).unwrap();
+            bincode::serialize(&AddGroupsSendMetaData { new_groups_info }).unwrap();
 
         let mut recv_meta_data_length = 0usize;
         let mut recv_data_length = 0usize;
@@ -86,22 +222,22 @@ impl Sender {
                 }
             }
             Err(e) => {
-                error!("add new servers failed: {}", e);
+                error!("add new groups failed: {}", e);
                 Err(CONNECTION_ERROR)
             }
         }
     }
 
-    pub async fn delete_servers(
+    pub async fn delete_groups(
         &self,
         manager_address: &str,
-        deleted_servers_info: Vec<String>,
+        deleted_groups_info: Vec<String>,
     ) -> Result<(), i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
-        let send_meta_data = bincode::serialize(&DeleteNodesSendMetaData {
-            deleted_servers_info,
+        let send_meta_data = bincode::serialize(&DeleteGroupsSendMetaData {
+            deleted_groups_info,
         })
         .unwrap();
 
@@ -135,13 +271,13 @@ impl Sender {
                 }
             }
             Err(e) => {
-                error!("delete servers failed: {}", e);
+                error!("delete groups failed: {}", e);
                 Err(CONNECTION_ERROR)
             }
         }
     }
 
-    pub async fn get_cluster_status(&self, manager_address: &str) -> Result<ClusterStatus, i32> {
+    pub async fn get_cluster_status(&self, manager_address: &str) -> Result<i32, i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -280,7 +416,7 @@ impl Sender {
     pub async fn get_groups_info(
         &self,
         manager_address: &str,
-    ) -> Result<Vec<(String, Vec<(String, ServerStatus)>)>, i32> {
+    ) -> Result<Vec<Group>, i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -312,9 +448,9 @@ impl Sender {
                 if status != 0 {
                     return Err(status);
                 }
-                let replica_sets_info: Vec<(String, Vec<(String, ServerStatus)>)> =
+                let groups_info: Vec<Group> =
                     bincode::deserialize(&recv_meta_data[..recv_meta_data_length]).unwrap();
-                Ok(replica_sets_info)
+                Ok(groups_info)
             }
             Err(e) => {
                 error!("get replica sets info failed: {}", e);
@@ -323,7 +459,7 @@ impl Sender {
         }
     }
 
-    pub async fn list_volumes(&self, address: &str) -> Result<Vec<Volume>, i32> {
+    pub async fn list_volumes(&self, group_id: &str) -> Result<Vec<Volume>, i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -333,9 +469,8 @@ impl Sender {
         let mut recv_meta_data = vec![0u8; 65535];
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::ListVolumes.into(),
                 0,
                 "",
@@ -366,7 +501,7 @@ impl Sender {
         }
     }
 
-    pub async fn create_volume(&self, address: &str, name: &str, size: u64) -> Result<(), i32> {
+    pub async fn create_volume(&self, group_id: &str, name: &str, size: u64) -> Result<(), i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -376,9 +511,8 @@ impl Sender {
         let mut recv_data_length = 0usize;
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::CreateVolume.into(),
                 0,
                 name,
@@ -407,7 +541,7 @@ impl Sender {
         }
     }
 
-    pub async fn delete_volume(&self, address: &str, name: &str) -> Result<(), i32> {
+    pub async fn delete_volume(&self, group_id: &str, name: &str) -> Result<(), i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -415,9 +549,8 @@ impl Sender {
         let mut recv_data_length = 0usize;
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::DeleteVolume.into(),
                 0,
                 name,
@@ -446,7 +579,7 @@ impl Sender {
         }
     }
 
-    pub async fn clean_volume(&self, address: &str, name: &str) -> Result<(), i32> {
+    pub async fn clean_volume(&self, group_id: &str, name: &str) -> Result<(), i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -454,9 +587,8 @@ impl Sender {
         let mut recv_data_length = 0usize;
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::CleanVolume.into(),
                 0,
                 name,
@@ -485,7 +617,7 @@ impl Sender {
         }
     }
 
-    pub async fn init_volume(&self, address: &str, name: &str) -> Result<(), i32> {
+    pub async fn init_volume(&self, group_id: &str, name: &str) -> Result<(), i32> {
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -493,9 +625,8 @@ impl Sender {
         let mut recv_data_length = 0usize;
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::InitVolume.into(),
                 0,
                 name,
@@ -526,7 +657,7 @@ impl Sender {
 
     pub async fn create_no_parent(
         &self,
-        address: &str,
+        group_id: &str,
         operation_type: OperationType,
         parent: &str,
         send_meta_data: &[u8],
@@ -540,9 +671,8 @@ impl Sender {
         let mut recv_meta_data = vec![0u8; 1024];
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 operation_type.into(),
                 0,
                 parent,
@@ -574,7 +704,7 @@ impl Sender {
 
     pub async fn delete_no_parent(
         &self,
-        address: &str,
+        group_id: &str,
         operation_type: OperationType,
         parent: &str,
         send_meta_data: &[u8],
@@ -588,9 +718,8 @@ impl Sender {
         let mut recv_meta_data = vec![0u8; 1024];
 
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 operation_type.into(),
                 0,
                 parent,
@@ -622,16 +751,15 @@ impl Sender {
 
     pub async fn directory_add_entry(
         &self,
-        address: &str,
+        group_id: &str,
         path: &str,
         send_meta_data: &[u8],
     ) -> Result<(), i32> {
         let (mut status, mut rsp_flags, mut recv_meta_data_length, mut recv_data_length) =
             (0, 0, 0, 0);
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::DirectoryAddEntry as u32,
                 0,
                 path,
@@ -663,16 +791,15 @@ impl Sender {
 
     pub async fn directory_delete_entry(
         &self,
-        address: &str,
+        group_id: &str,
         path: &str,
         send_meta_data: &[u8],
     ) -> Result<(), i32> {
         let (mut status, mut rsp_flags, mut recv_meta_data_length, mut recv_data_length) =
             (0, 0, 0, 0);
         let result = self
-            .client
-            .call_remote(
-                address,
+             .call_remote_by_group(
+                group_id,
                 OperationType::DirectoryDeleteEntry as u32,
                 0,
                 path,

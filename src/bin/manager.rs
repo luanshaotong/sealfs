@@ -5,7 +5,7 @@
 use clap::Parser;
 use env_logger::fmt;
 use log::{error, info, warn};
-use sealfs::manager::manager_service::update_server_status;
+use sealfs::manager::manager_service::update_group_status;
 use sealfs::{manager::manager_service::ManagerService, rpc::server::RpcServer};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -140,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    update_server_status(manager.manager.clone()).await;
+    update_group_status(manager.manager.clone()).await;
 
     Ok(())
 }

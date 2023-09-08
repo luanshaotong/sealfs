@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod daemon;
 pub mod fuse_client;
+pub mod connector;
 
 use clap::{Parser, Subcommand};
 use env_logger::fmt;
@@ -17,18 +18,18 @@ use crate::{
     client::daemon::{LocalCli, SealfsFused},
     common::{
         errors::status_to_string,
-        info_syncer::{init_network_connections, ClientStatusMonitor, InfoSyncer},
+        group_manager::{init_network_connections, init_network_connections_with_servers, Group, ServerInfo}, serialization::GroupStatus,
     },
     rpc::server::RpcServer,
 };
 
-use self::fuse_client::Client;
+use self::fuse_client::FSClient;
 
 const LOCAL_PATH: &str = "/tmp/sealfs.sock";
 const LOCAL_INDEX_PATH: &str = "/tmp/sealfs.index";
 
 #[derive(Parser)]
-#[command(author = "Christopher Berner", version, about, long_about = None)]
+#[command(author = "Sealfs", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -156,12 +157,12 @@ enum Commands {
 }
 
 struct SealFS {
-    client: Arc<Client>,
+    client: Arc<FSClient>,
     volume_root_inode: u64,
 }
 
 impl SealFS {
-    fn new(client: Arc<Client>, volume_root_inode: u64) -> Self {
+    fn new(client: Arc<FSClient>, volume_root_inode: u64) -> Self {
         Self {
             client,
             volume_root_inode,
@@ -376,7 +377,7 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("spawn client");
 
-    let client = Arc::new(Client::new());
+    let client = Arc::new(FSClient::new());
 
     match cli.command {
         Commands::CreateVolume {
@@ -392,10 +393,10 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
+            init_network_connections(manager_address, client.cluster_manager.group_manger.clone()).await;
 
             info!("connect_servers");
-            if let Err(status) = client.connect_servers().await {
+            if let Err(status) = client.cluster_manager.group_manger.connect_servers().await {
                 error!(
                     "connect_servers failed, status = {:?}",
                     status_to_string(status)
@@ -429,10 +430,10 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
+            init_network_connections(manager_address, client.cluster_manager.group_manger.clone()).await;
 
             info!("connect_servers");
-            if let Err(status) = client.connect_servers().await {
+            if let Err(status) = client.cluster_manager.group_manger.connect_servers().await {
                 error!(
                     "connect_servers failed, status = {:?}",
                     status_to_string(status)
@@ -467,16 +468,7 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 None => "127.0.0.1:8081".to_owned(),
             };
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
-
-            info!("connect_servers");
-            if let Err(status) = client.connect_servers().await {
-                error!(
-                    "connect_servers failed, status = {:?}",
-                    status_to_string(status)
-                );
-                return Ok(());
-            }
+            init_network_connections_with_servers(manager_address, client.cluster_manager.group_manger.clone()).await;
 
             let sealfsd = SealfsFused::new(index_file, client);
             match sealfsd.init().await {
@@ -566,10 +558,16 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
+            init_network_connections(manager_address, client.cluster_manager.group_manger.clone()).await;
 
-            let new_servers_info = vec![(server_address.unwrap(), weight.unwrap_or(100))];
-            let result = client.add_new_servers(new_servers_info).await;
+            let server_address = match server_address {
+                Some(address) => address,
+                None => "".to_owned(),
+            };
+
+
+            let new_servers_info = vec![Group::new(server_address.clone(), server_address.clone(), vec![ServerInfo::new(server_address.clone(), server_address.clone())], GroupStatus::Initializing, weight.unwrap_or(100))];  // TODO
+            let result = client.add_new_groups(new_servers_info).await;
 
             match result {
                 Ok(_) => {
@@ -591,7 +589,7 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
+            init_network_connections(manager_address, client.cluster_manager.group_manger.clone()).await;
 
             let new_servers_info = vec![server_address.unwrap()];
             let result = client.delete_servers(new_servers_info).await;
@@ -613,10 +611,10 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 None => "127.0.0.1:8081".to_owned(),
             };
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
+            init_network_connections(manager_address, client.cluster_manager.group_manger.clone()).await;
 
             info!("connect_servers");
-            if let Err(status) = client.connect_servers().await {
+            if let Err(status) = client.cluster_manager.group_manger.connect_servers().await {
                 error!(
                     "connect_servers failed, status = {:?}",
                     status_to_string(status)
@@ -670,8 +668,8 @@ pub async fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!("init client");
-            init_network_connections(manager_address, client.clone()).await;
-            let result = client.get_cluster_status().await;
+            init_network_connections(manager_address, client.cluster_manager.group_manger.clone()).await;
+            let result = client.cluster_manager.group_manger.get_cluster_status().await;
             match result {
                 Ok(status) => {
                     info!("get cluster status success");

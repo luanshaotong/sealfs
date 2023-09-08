@@ -75,7 +75,7 @@ impl HashRing {
         self.groups.contains_key(group)
     }
 
-    pub fn get_server_lists(&self) -> Vec<String> {
+    pub fn get_group_lists(&self) -> Vec<String> {
         self.groups.keys().cloned().collect()
     }
 }

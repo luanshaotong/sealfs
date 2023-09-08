@@ -5,6 +5,8 @@
 pub mod distributed_engine;
 pub mod storage_engine;
 mod transfer_manager;
+pub mod journal;
+pub mod connector;
 use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -18,12 +20,11 @@ use tokio::time::sleep;
 use crate::{
     common::{
         errors::status_to_string,
-        hash_ring::HashRing,
         serialization::{
             bytes_as_file_attr, ClusterStatus, CreateDirSendMetaData, CreateFileSendMetaData,
             CreateVolumeSendMetaData, DeleteDirSendMetaData, DeleteFileSendMetaData,
             DirectoryEntrySendMetaData, OpenFileSendMetaData, OperationType, ReadDirSendMetaData,
-            ServerStatus, TruncateFileSendMetaData,
+            GroupStatus, TruncateFileSendMetaData,
         },
         serialization::{ReadFileSendMetaData, WriteFileSendMetaData},
     },
@@ -37,217 +38,6 @@ use storage_engine::file_engine::FileEngine;
 pub enum ServerError {
     #[error("ParseHeaderError")]
     ParseHeaderError,
-}
-
-pub async fn sync_cluster_status(engine: Arc<DistributedEngine<FileEngine>>) {
-    loop {
-        {
-            let result = engine.get_cluster_status().await;
-            match result {
-                Ok(status) => {
-                    let status: i32 = status.into();
-                    if engine.cluster_status.load(Ordering::Relaxed) != status {
-                        engine.cluster_status.store(status, Ordering::Relaxed);
-                        debug!("sync server status, status = {}", status);
-                    }
-                }
-                Err(e) => {
-                    error!("sync server status failed, error = {}", e);
-                }
-            }
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-
-pub async fn watch_status(engine: Arc<DistributedEngine<FileEngine>>) {
-    loop {
-        if engine.closed.load(Ordering::Relaxed) {
-            error!("watch status: server closed");
-            break;
-        }
-        match engine
-            .cluster_status
-            .load(Ordering::Relaxed)
-            .try_into()
-            .unwrap()
-        {
-            ClusterStatus::SyncNewHashRing => {
-                info!("watch status: start to sync new hash ring");
-                let all_servers_address = match engine.get_new_hash_ring_info().await {
-                    Ok(value) => value,
-                    Err(e) => {
-                        panic!("Get Hash Ring Info Failed. Error = {}", e);
-                    }
-                };
-                info!("watch status: get new hash ring info");
-                for value in all_servers_address.iter() {
-                    if engine.group_id == value.0
-                        || engine.hash_ring.read().as_ref().unwrap().contains(&value.0)
-                    {
-                        continue;
-                    }
-                    if let Err(e) = engine.add_connection(value.0.clone()).await {
-                        // TODO: rollback the transfer process
-                        panic!("watch status: add connection failed, error = {}", e);
-                    }
-                }
-                engine
-                    .new_hash_ring
-                    .write()
-                    .replace(HashRing::new(all_servers_address));
-                info!("watch status: sync new hash ring finished");
-                match engine.update_server_status(ServerStatus::PreTransfer).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        panic!("update server status failed, error = {}", e);
-                    }
-                }
-
-                while <i32 as TryInto<ClusterStatus>>::try_into(
-                    engine.cluster_status.load(Ordering::Relaxed),
-                )
-                .unwrap()
-                    == ClusterStatus::SyncNewHashRing
-                {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                assert!(
-                    <i32 as TryInto<ClusterStatus>>::try_into(
-                        engine.cluster_status.load(Ordering::Relaxed)
-                    )
-                    .unwrap()
-                        == ClusterStatus::PreTransfer
-                );
-
-                let file_map = engine.make_up_file_map();
-
-                info!("watch status: start to transfer files");
-                match engine
-                    .update_server_status(ServerStatus::Transferring)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        panic!("update server status failed, error = {}", e);
-                    }
-                }
-                while <i32 as TryInto<ClusterStatus>>::try_into(
-                    engine.cluster_status.load(Ordering::Relaxed),
-                )
-                .unwrap()
-                    == ClusterStatus::PreTransfer
-                {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                assert!(
-                    <i32 as TryInto<ClusterStatus>>::try_into(
-                        engine.cluster_status.load(Ordering::Relaxed)
-                    )
-                    .unwrap()
-                        == ClusterStatus::Transferring
-                );
-
-                if let Err(e) = engine.transfer_files(file_map).await {
-                    panic!("transfer files failed, error = {}", e);
-                }
-
-                info!("watch status: transfer files finished");
-                match engine.update_server_status(ServerStatus::PreFinish).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        panic!("update server status failed, error = {}", e);
-                    }
-                }
-
-                while <i32 as TryInto<ClusterStatus>>::try_into(
-                    engine.cluster_status.load(Ordering::Relaxed),
-                )
-                .unwrap()
-                    == ClusterStatus::Transferring
-                {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                assert!(
-                    <i32 as TryInto<ClusterStatus>>::try_into(
-                        engine.cluster_status.load(Ordering::Relaxed)
-                    )
-                    .unwrap()
-                        == ClusterStatus::PreFinish
-                );
-
-                let _old_hash_ring = engine
-                    .hash_ring
-                    .write()
-                    .replace(engine.new_hash_ring.read().clone().unwrap()); // TODO: _old_hash_ring should be used to rollback the transfer process
-
-                info!("watch status: start to finishing");
-                match engine.update_server_status(ServerStatus::Finishing).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        panic!("update server status failed, error = {}", e);
-                    }
-                }
-
-                while <i32 as TryInto<ClusterStatus>>::try_into(
-                    engine.cluster_status.load(Ordering::Relaxed),
-                )
-                .unwrap()
-                    == ClusterStatus::PreFinish
-                {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                assert!(
-                    <i32 as TryInto<ClusterStatus>>::try_into(
-                        engine.cluster_status.load(Ordering::Relaxed)
-                    )
-                    .unwrap()
-                        == ClusterStatus::Finishing
-                );
-
-                let _ = engine.new_hash_ring.write().take();
-                // here we should close connections to old servers, but now we just wait for remote servers to close connections and do nothing
-
-                info!("watch status: start to finishing");
-                match engine.update_server_status(ServerStatus::Finished).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        panic!("update server status failed, error = {}", e);
-                    }
-                }
-
-                while <i32 as TryInto<ClusterStatus>>::try_into(
-                    engine.cluster_status.load(Ordering::Relaxed),
-                )
-                .unwrap()
-                    == ClusterStatus::Finishing
-                {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                assert!(
-                    <i32 as TryInto<ClusterStatus>>::try_into(
-                        engine.cluster_status.load(Ordering::Relaxed)
-                    )
-                    .unwrap()
-                        == ClusterStatus::Idle
-                );
-
-                info!("watch status: transferring data finished");
-            }
-            ClusterStatus::Idle => {
-                sleep(Duration::from_secs(1)).await;
-            }
-            ClusterStatus::Initializing => {
-                sleep(Duration::from_secs(1)).await;
-            }
-            ClusterStatus::NodesStarting => {
-                sleep(Duration::from_secs(1)).await;
-            }
-            e => {
-                panic!("cluster status error: {:?}", e as u32);
-            }
-        }
-    }
 }
 
 pub async fn run(
@@ -282,7 +72,7 @@ pub async fn run(
     if let Err(e) = engine.client.add_connection(&manager_address).await {
         panic!("Connect To Manager Failed, Error = {}", e);
     }
-    *engine.manager_address.lock().await = manager_address;
+    engine.cluster_manager.set_manager_address(manager_address);
 
     tokio::spawn(sync_cluster_status(Arc::clone(&engine)));
 
@@ -305,7 +95,7 @@ pub async fn run(
         }
     });
 
-    info!("Init: Add connections and update Server Status");
+    info!("Init: Add connections and update group Status");
 
     let hash_ring_info = match engine.get_hash_ring_info().await {
         Ok(value) => value,
@@ -323,11 +113,11 @@ pub async fn run(
     };
 
     for value in groups_info.iter() {
-        for value in value.1.iter() {
-            if server_address == value.0 {
+        for value in value.2.iter() {
+            if &server_address == value {
                 continue;
             }
-            if let Err(e) = engine.add_connection(value.0.clone()).await {
+            if let Err(e) = engine.add_connection(value).await {
                 panic!("Init: Add Connection Failed. Error = {}", e);
             }
         }
@@ -338,17 +128,18 @@ pub async fn run(
         .write()
         .replace(HashRing::new(hash_ring_info));
     info!("Init: Update Hash Ring Success.");
+    engine.cluster_manager.sync(groups_info);
 
     match <i32 as TryInto<ClusterStatus>>::try_into(engine.cluster_status.load(Ordering::Relaxed))
         .unwrap()
     {
         ClusterStatus::Initializing => {
-            match engine.update_server_status(ServerStatus::Finished).await {
+            match engine.update_group_status(GroupStatus::Finished).await {
                 Ok(_) => {
-                    info!("Update Server Status to Finish Success.");
+                    info!("Update Group Status to Finish Success.");
                 }
                 Err(e) => {
-                    panic!("Update Server Status to Finish Failed. Error = {}", e);
+                    panic!("Update Group Status to Finish Failed. Error = {}", e);
                 }
             }
         }

@@ -2,124 +2,58 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::common::errors::CONNECTION_ERROR;
-use crate::common::hash_ring::HashRing;
-use crate::common::info_syncer::{ClientStatusMonitor, InfoSyncer};
-use crate::common::group_manager::GroupManager;
-use crate::common::sender::{Sender, REQUEST_TIMEOUT};
+use crate::common::group_manager::Group;
+use crate::common::group_manager::sender::{Sender, REQUEST_TIMEOUT};
 use crate::common::serialization::{
-    file_attr_as_bytes_mut, ClusterStatus, CreateDirSendMetaData, CreateFileSendMetaData,
+    file_attr_as_bytes_mut, CreateDirSendMetaData, CreateFileSendMetaData,
     DeleteDirSendMetaData, DeleteFileSendMetaData, OpenFileSendMetaData, OperationType,
     ReadDirSendMetaData, ReadFileSendMetaData, Volume, WriteFileSendMetaData,
 };
 use crate::common::util::{empty_dir, empty_file};
-use crate::rpc;
-use crate::rpc::client::TcpStreamCreator;
-use async_trait::async_trait;
+use crate::rpc::client::RpcClient;
 use dashmap::DashMap;
 use fuser::{
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyWrite,
 };
 use libc::{mode_t, DT_DIR, DT_LNK, DT_REG};
-use log::{debug, error};
-use spin::RwLock;
+use log::debug;
 use std::ffi::{OsStr, OsString};
 use std::ops::Deref;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::time::Duration;
+
+use super::connector::ClientClusterManager;
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-pub struct Client {
-    pub client: Arc<
-        rpc::client::RpcClient<
-            tokio::net::tcp::OwnedReadHalf,
-            tokio::net::tcp::OwnedWriteHalf,
-            TcpStreamCreator,
-        >,
-    >,
+pub struct FSClient {
     pub sender: Arc<Sender>,
     pub inodes: DashMap<String, u64>,
     pub inodes_reverse: DashMap<u64, String>,
     pub inode_counter: std::sync::atomic::AtomicU64,
     pub fd_counter: std::sync::atomic::AtomicU64,
     pub handle: tokio::runtime::Handle,
-    pub cluster_status: AtomicI32,
-    pub hash_ring: Arc<RwLock<Option<HashRing>>>,
-    pub new_hash_ring: Arc<RwLock<Option<HashRing>>>,
-    pub group_manager: Arc<RwLock<GroupManager>>,
-    pub manager_address: Arc<tokio::sync::Mutex<String>>,
+    pub cluster_manager: Arc<ClientClusterManager>,
 }
 
-impl Default for Client {
+impl Default for FSClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[async_trait]
-impl InfoSyncer for Client {
-    async fn get_cluster_status(&self) -> Result<ClusterStatus, i32> {
-        self.sender
-            .get_cluster_status(&self.manager_address.lock().await)
-            .await
-    }
-
-    fn cluster_status(&self) -> &AtomicI32 {
-        &self.cluster_status
-    }
-}
-
-#[async_trait]
-impl ClientStatusMonitor for Client {
-    fn sender(&self) -> &Sender {
-        &self.sender
-    }
-    fn manager_address(&self) -> &Arc<tokio::sync::Mutex<String>> {
-        &self.manager_address
-    }
-    fn hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>> {
-        &self.hash_ring
-    }
-    async fn add_connection(&self, server_address: &str) -> Result<(), i32> {
-        self.client
-            .add_connection(server_address)
-            .await
-            .map_err(|e| {
-                error!("add connection failed: {:?}", e);
-                CONNECTION_ERROR
-            })
-    }
-    fn new_hash_ring(&self) -> &Arc<RwLock<Option<HashRing>>> {
-        &self.new_hash_ring
-    }
-    fn replica_manager(&self) -> &Arc<RwLock<GroupManager>> {
-        &self.group_manager
-    }
-}
-
-impl Client {
+impl FSClient {
     pub fn new() -> Self {
-        let client = Arc::new(rpc::client::RpcClient::default());
+        let info_syncer = Arc::new(ClientClusterManager::new(vec![], Arc::new(RpcClient::default())));
         Self {
-            client: client.clone(),
-            sender: Arc::new(Sender::new(client)),
+            sender: info_syncer.group_manger.sender.clone(),
             inodes: DashMap::new(),
             inodes_reverse: DashMap::new(),
             inode_counter: std::sync::atomic::AtomicU64::new(1),
             fd_counter: std::sync::atomic::AtomicU64::new(1),
             handle: tokio::runtime::Handle::current(),
-            cluster_status: AtomicI32::new(ClusterStatus::Initializing.into()),
-            hash_ring: Arc::new(RwLock::new(None)),
-            new_hash_ring: Arc::new(RwLock::new(None)),
-            group_manager: Arc::new(RwLock::new(GroupManager::new(vec![]))),
-            manager_address: Arc::new(tokio::sync::Mutex::new("".to_string())),
+            cluster_manager: info_syncer,
         }
-    }
-
-    pub fn remove_connection(&self, server_address: &str) {
-        self.client.remove_connection(server_address);
     }
 
     pub fn get_new_inode(&self) -> u64 {
@@ -142,7 +76,7 @@ impl Client {
         self.inodes_reverse.insert(inode, volume_name.to_string());
         self.inodes.insert(volume_name.to_string(), inode);
         self.sender
-            .init_volume(&self.get_connection_address(volume_name), volume_name)
+            .init_volume(&self.cluster_manager.get_target_group(volume_name), volume_name)
             .await?;
         Ok(inode)
     }
@@ -150,8 +84,8 @@ impl Client {
     pub async fn list_volumes(&self) -> Result<Vec<Volume>, i32> {
         let mut volumes: Vec<Volume> = Vec::new();
 
-        for server_address in self.hash_ring.read().as_ref().unwrap().get_server_lists() {
-            let mut new_volumes = self.sender.list_volumes(&server_address).await?;
+        for group in self.cluster_manager.group_manger.groups.get_groups_info() {
+            let mut new_volumes = self.sender.list_volumes(&group.group_id).await?;
             volumes.append(&mut new_volumes);
         }
         Ok(volumes)
@@ -159,7 +93,7 @@ impl Client {
 
     pub async fn delete_servers(&self, servers_info: Vec<String>) -> Result<(), i32> {
         self.sender
-            .delete_servers(&self.manager_address.lock().await, servers_info)
+            .delete_groups(&self.cluster_manager.group_manger.groups.get_manager_address().unwrap(), servers_info)
             .await
     }
 
@@ -170,13 +104,19 @@ impl Client {
 
     pub async fn create_volume(&self, name: &str, size: u64) -> Result<(), i32> {
         self.sender
-            .create_volume(&self.get_connection_address(name), name, size)
+            .create_volume(&self.cluster_manager.get_target_group(name), name, size)
             .await
     }
 
     pub async fn delete_volume(&self, name: &str) -> Result<(), i32> {
         self.sender
-            .delete_volume(&self.get_connection_address(name), name)
+            .delete_volume(&self.cluster_manager.get_target_group(name), name)
+            .await
+    }
+
+    pub async fn add_new_groups(&self, new_groups_info: Vec<Group>) -> Result<(), i32> {
+        self.sender
+            .add_new_groups(&self.cluster_manager.group_manger.groups.get_manager_address().unwrap(), new_groups_info)
             .await
     }
 
@@ -194,7 +134,7 @@ impl Client {
                 return;
             }
         };
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -205,9 +145,9 @@ impl Client {
         let recv_meta_data = file_attr_as_bytes_mut(&mut file_attr);
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::GetFileAttr.into(),
                 0,
                 &path,
@@ -268,7 +208,7 @@ impl Client {
                 return;
             }
         };
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -287,9 +227,9 @@ impl Client {
         .unwrap();
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::CreateFile.into(),
                 0,
                 &path,
@@ -345,7 +285,7 @@ impl Client {
             }
         };
         debug!("getattr_remote path: {:?}", path);
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -356,9 +296,9 @@ impl Client {
         let recv_meta_data = file_attr_as_bytes_mut(&mut file_attr);
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::GetFileAttr.into(),
                 0,
                 &path,
@@ -418,7 +358,7 @@ impl Client {
         };
         let size = 2048;
 
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let md = ReadDirSendMetaData {
             offset,
             size: size as u32,
@@ -434,9 +374,9 @@ impl Client {
         let mut recv_data = vec![0u8; size];
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::ReadDir.into(),
                 0,
                 &path,
@@ -507,7 +447,7 @@ impl Client {
                 return;
             }
         };
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
 
         let meta_data = bincode::serialize(&ReadFileSendMetaData { offset, size }).unwrap();
 
@@ -520,9 +460,9 @@ impl Client {
         let mut recv_data = vec![0u8; size as usize];
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::ReadFile.into(),
                 0,
                 &path,
@@ -567,7 +507,7 @@ impl Client {
             }
         };
         debug!("write_remote path: {:?}, data_len: {}", path, data.len());
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let send_meta_data = bincode::serialize(&WriteFileSendMetaData { offset }).unwrap();
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
@@ -578,9 +518,9 @@ impl Client {
         let mut recv_meta_data = vec![0u8; 4];
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::WriteFile.into(),
                 0,
                 &path,
@@ -620,7 +560,7 @@ impl Client {
             }
         };
         debug!("mkdir_remote ,path: {:?}", &path);
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -638,9 +578,9 @@ impl Client {
         .unwrap();
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::CreateDir.into(),
                 0,
                 &path,
@@ -698,7 +638,7 @@ impl Client {
                 return;
             }
         };
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -716,9 +656,9 @@ impl Client {
         let send_meta_data = bincode::serialize(&OpenFileSendMetaData { flags, mode }).unwrap();
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::OpenFile.into(),
                 0,
                 &path,
@@ -754,7 +694,7 @@ impl Client {
                 return;
             }
         };
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -767,9 +707,9 @@ impl Client {
         .unwrap();
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::DeleteFile.into(),
                 0,
                 &path,
@@ -808,7 +748,7 @@ impl Client {
                 return;
             }
         };
-        let server_address = self.get_connection_address(&path);
+        let group_id = self.cluster_manager.get_target_group(&path);
         let mut status = 0i32;
         let mut rsp_flags = 0u32;
 
@@ -821,9 +761,9 @@ impl Client {
         .unwrap();
 
         let result = self
-            .client
-            .call_remote(
-                &server_address,
+             .sender
+             .call_remote_by_group(
+                &group_id,
                 OperationType::DeleteDir.into(),
                 0,
                 &path,

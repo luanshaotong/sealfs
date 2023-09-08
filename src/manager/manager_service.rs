@@ -5,10 +5,10 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    common::serialization::{
-        AddNodesSendMetaData, ClusterStatus, DeleteNodesSendMetaData, GetClusterStatusRecvMetaData,
-        GetHashRingInfoRecvMetaData, ManagerOperationType, ServerStatus, GetGroupsRecvMetaData,
-    },
+    common::{serialization::{
+        AddGroupsSendMetaData, ClusterStatus, DeleteGroupsSendMetaData, GetClusterStatusRecvMetaData,
+        GetHashRingInfoRecvMetaData, ManagerOperationType, GroupStatus, GetGroupsRecvMetaData,
+    }, group_manager::Group},
     rpc::server::Handler,
 };
 
@@ -21,134 +21,85 @@ pub struct ManagerService {
     pub manager: Arc<Manager>,
 }
 
-pub async fn update_server_status(manager: Arc<Manager>) {
+pub async fn update_group_status(manager: Arc<Manager>) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if manager.closed.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let status = *manager.cluster_status.lock().unwrap();
+        let group_manager = manager.group_manager.lock().unwrap();
+        let status = group_manager.get_cluster_status();
         debug!("current cluster status is {:?}", status);
-        match status {
+        match status.try_into().unwrap() {
             ClusterStatus::Idle => {}
             ClusterStatus::NodesStarting => {
-                // if all servers is ready, change the cluster status to SyncNewHashRing
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::Finished);
-                if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::SyncNewHashRing;
-                    info!("all servers is ready, change the cluster status to SyncNewHashRing");
+                // if all groups is ready, change the cluster status to SyncNewHashRing
+                if group_manager.all_servers_ready_for(GroupStatus::Finished) {
+                    group_manager.set_cluster_status(ClusterStatus::SyncNewHashRing.into());
+                    info!("all groups is ready, change the cluster status to SyncNewHashRing");
                 };
             }
             ClusterStatus::SyncNewHashRing => {
-                // if all servers is ready, change the cluster status to PreTransfer
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::PreTransfer);
-                if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::PreTransfer;
-                    info!("all servers is ready, change the cluster status to PreTransfer");
+                // if all groups is ready, change the cluster status to PreTransfer
+                if group_manager.all_servers_ready_for(GroupStatus::PreTransfer) {
+                    group_manager.set_cluster_status(ClusterStatus::PreTransfer.into());
+                    info!("all groups is ready, change the cluster status to PreTransfer");
                 }
             }
             ClusterStatus::PreTransfer => {
-                // if all servers is ready, change the cluster status to Transferring
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::Transferring);
+                // if all groups is ready, change the cluster status to Transferring
+                let flag = group_manager.all_servers_ready_for(GroupStatus::Transferring);
                 if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::Transferring;
-                    info!("all servers is ready, change the cluster status to Transferring");
+                    group_manager.set_cluster_status(ClusterStatus::Transferring.into());
+                    info!("all groups is ready, change the cluster status to Transferring");
                 }
             }
             ClusterStatus::Transferring => {
-                // if all servers is ready, change the cluster status to PreFinish
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::PreFinish);
+                // if all groups is ready, change the cluster status to PreFinish
+                let flag = group_manager.all_servers_ready_for(GroupStatus::PreFinish);
                 if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::PreFinish;
-                    info!("all servers is ready, change the cluster status to PreFinish");
+                    group_manager.set_cluster_status(ClusterStatus::PreFinish.into());
+                    info!("all groups is ready, change the cluster status to PreFinish");
                 }
             }
             ClusterStatus::PreFinish => {
-                // if all servers is ready, change the cluster status to Finishing
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::Finishing);
-                if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let _ = manager
-                        .hashring
-                        .write()
-                        .unwrap()
-                        .replace(manager.new_hashring.read().unwrap().clone().unwrap());
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::Finishing;
-                    info!("all servers is ready, change the cluster status to Finishing");
+                // if all groups is ready, change the cluster status to Finishing
+                if group_manager.all_servers_ready_for(GroupStatus::Finished) {
+                    match group_manager.replace_hash_ring_with_new() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            // TODO: rollback the transfer process and deal with the error
+                            panic!("replace hash ring with new failed, error: {}", e);
+                        }
+                    }
+                    group_manager.set_cluster_status(ClusterStatus::Finishing.into());
+                    info!("all groups is ready, change the cluster status to Finishing");
                 }
             }
             ClusterStatus::Finishing => {
-                // if all servers is ready, change the cluster status to Idle
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::Finished);
-                if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let mut new_hashring = manager.new_hashring.write().unwrap();
-                    manager
-                        .servers
-                        .lock()
-                        .unwrap()
-                        .retain(|k, _| new_hashring.as_ref().unwrap().contains(k));
+                // if all groups is ready, change the cluster status to Idle
+                if group_manager.all_servers_ready_for(GroupStatus::Finished) {
                     // move new_hashring to hashring
-                    let _ = new_hashring.take().unwrap();
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::Idle;
-                    info!("all servers is ready, change the cluster status to Idle");
+                    group_manager.remove_groups_not_in_new_hash_ring();
+                    let _ = group_manager.take_new_hash_ring();
+                    group_manager.set_cluster_status(ClusterStatus::Idle.into());
+                    info!("all groups is ready, change the cluster status to Idle");
                 }
             }
             ClusterStatus::Initializing => {
-                // if all servers is ready, change the cluster status to Idle
-                let flag = manager
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|kv| kv.1.status == ServerStatus::Finished);
-                if flag {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    *manager.cluster_status.lock().unwrap() = ClusterStatus::Idle;
-                    info!("all servers is ready, change the cluster status to Idle");
+                // if all groups is ready, change the cluster status to Idle
+                if group_manager.all_servers_ready_for(GroupStatus::Finished) {
+                    group_manager.set_cluster_status(ClusterStatus::Idle.into());
+                    info!("all groups is ready, change the cluster status to Idle");
                 }
             }
-            s => panic!("update server status failed, invalid cluster status: {}", s),
+            s => panic!("update group status failed, invalid cluster status: {}", s),
         }
     }
 }
 
 impl ManagerService {
-    pub fn new(groups: Vec<(String, usize, Vec<String>)>) -> Self {
+    pub fn new(groups: Vec<Group>) -> Self {
         let manager = Arc::new(Manager::new(groups));
         ManagerService { manager }
     }
@@ -168,7 +119,7 @@ impl Handler for ManagerService {
         let r#type = ManagerOperationType::try_from(operation_type).unwrap();
         match r#type {
             ManagerOperationType::GetClusterStatus => {
-                let status = self.manager.get_cluster_status();
+                let status = self.manager.group_manager.lock().unwrap().get_cluster_status();
                 let response_meta_data =
                     bincode::serialize(&GetClusterStatusRecvMetaData { status }).unwrap();
 
@@ -184,7 +135,7 @@ impl Handler for ManagerService {
                 ))
             }
             ManagerOperationType::GetHashRing => {
-                let hash_ring_info = self.manager.get_hash_ring_info();
+                let hash_ring_info = self.manager.group_manager.lock().unwrap().get_hash_ring_info();
 
                 info!("connection {} get hash ring: {:?}", id, hash_ring_info);
 
@@ -199,8 +150,8 @@ impl Handler for ManagerService {
                     Vec::new(),
                 ))
             }
-            ManagerOperationType::GetNewHashRing => match self.manager.get_new_hash_ring_info() {
-                Ok(hash_ring_info) => {
+            ManagerOperationType::GetNewHashRing => match self.manager.group_manager.lock().unwrap().get_new_hash_ring_info() {
+                Some(hash_ring_info) => {
                     info!("connection {} get new hash ring: {:?}", id, hash_ring_info);
                     let response_meta_data =
                         bincode::serialize(&GetHashRingInfoRecvMetaData { hash_ring_info })
@@ -214,17 +165,17 @@ impl Handler for ManagerService {
                         Vec::new(),
                     ))
                 }
-                Err(e) => {
-                    error!("get new hash ring error: {}", e);
+                None => {
+                    error!("connection {} get new hash ring failed, new hash ring is empty", id);
                     Ok((libc::ENOENT, 0, 0, 0, Vec::new(), Vec::new()))
                 }
             },
             ManagerOperationType::AddNodes => {
-                let new_servers_info = bincode::deserialize::<AddNodesSendMetaData>(&metadata)
+                let new_groups_info = bincode::deserialize::<AddGroupsSendMetaData>(&metadata)
                     .unwrap()
-                    .new_servers_info;
-                info!("connection {} add nodes: {:?}", id, new_servers_info);
-                match self.manager.add_nodes(new_servers_info) {
+                    .new_groups_info;
+                info!("connection {} add nodes: {:?}", id, new_groups_info.iter().map(|g| g.group_id.clone()).collect::<Vec<String>>());
+                match self.manager.group_manager.lock().unwrap().add_groups(new_groups_info) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
                     Some(e) => {
                         error!("add nodes error: {}", e);
@@ -233,12 +184,12 @@ impl Handler for ManagerService {
                 }
             }
             ManagerOperationType::RemoveNodes => {
-                let deleted_servers_info =
-                    bincode::deserialize::<DeleteNodesSendMetaData>(&metadata)
+                let deleted_groups_info =
+                    bincode::deserialize::<DeleteGroupsSendMetaData>(&metadata)
                         .unwrap()
-                        .deleted_servers_info;
-                info!("connection {} remove nodes: {:?}", id, deleted_servers_info);
-                match self.manager.delete_nodes(deleted_servers_info) {
+                        .deleted_groups_info;
+                info!("connection {} remove nodes: {:?}", id, deleted_groups_info);
+                match self.manager.group_manager.lock().unwrap().delete_nodes(deleted_groups_info) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
                     Some(e) => {
                         error!("remove nodes error: {}", e);
@@ -246,22 +197,22 @@ impl Handler for ManagerService {
                     }
                 }
             }
-            ManagerOperationType::UpdateServerStatus => {
-                info!("connection {} update server status", id);
-                match self.manager.set_server_status(
-                    String::from_utf8(path).unwrap(),
+            ManagerOperationType::UpdateGroupStatus => {
+                info!("connection {} update group status", id);
+                match self.manager.group_manager.lock().unwrap().set_group_status(
+                    std::str::from_utf8(&path).unwrap(),
                     bincode::deserialize(&metadata).unwrap(),
                 ) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
                     Some(e) => {
-                        error!("update server status error: {}", e);
+                        error!("update group status error: {}", e);
                         Ok((libc::EIO, 0, 0, 0, Vec::new(), Vec::new()))
                     }
                 }
             }
             ManagerOperationType::GetGroups => {
                 info!("connection {} get replica sets", id);
-                let groups_info = self.manager.get_groups_info();
+                let groups_info = self.manager.group_manager.lock().unwrap().get_groups_info();
                 let response_meta_data =
                     bincode::serialize(&GetGroupsRecvMetaData { groups_info }).unwrap();
                 Ok((

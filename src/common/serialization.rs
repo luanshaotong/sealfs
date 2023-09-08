@@ -14,6 +14,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::group_manager::Group;
+
 #[macro_export]
 macro_rules! offset_of {
     ($ty:ty, $field:ident) => {
@@ -23,6 +25,7 @@ macro_rules! offset_of {
     };
 }
 
+#[derive(Clone, Copy)]
 pub enum OperationType {
     Unkown = 0,
     Lookup = 1,
@@ -49,6 +52,7 @@ pub enum OperationType {
     ListVolumes = 22,
     DeleteVolume = 23,
     CleanVolume = 24,
+    ServerIsPrimary = 25,
 }
 
 impl TryFrom<u32> for OperationType {
@@ -81,6 +85,7 @@ impl TryFrom<u32> for OperationType {
             22 => Ok(OperationType::ListVolumes),
             23 => Ok(OperationType::DeleteVolume),
             24 => Ok(OperationType::CleanVolume),
+            25 => Ok(OperationType::ServerIsPrimary),
             _ => panic!("Unkown value: {}", value),
         }
     }
@@ -114,6 +119,7 @@ impl From<OperationType> for u32 {
             OperationType::ListVolumes => 22,
             OperationType::DeleteVolume => 23,
             OperationType::CleanVolume => 24,
+            OperationType::ServerIsPrimary => 25,
         }
     }
 }
@@ -124,9 +130,12 @@ pub enum ManagerOperationType {
     GetNewHashRing = 105,
     AddNodes = 106,
     RemoveNodes = 107,
-    UpdateServerStatus = 108,
-    FinishServer = 109,
+    UpdateGroupStatus = 108,
+    FinishGroup = 109,
     GetGroups = 110,
+    AcquireMaster = 111,
+    FinishMasterChange = 112,
+    FollowNewMaster = 113,
 }
 
 impl TryFrom<u32> for ManagerOperationType {
@@ -139,9 +148,12 @@ impl TryFrom<u32> for ManagerOperationType {
             105 => Ok(ManagerOperationType::GetNewHashRing),
             106 => Ok(ManagerOperationType::AddNodes),
             107 => Ok(ManagerOperationType::RemoveNodes),
-            108 => Ok(ManagerOperationType::UpdateServerStatus),
-            109 => Ok(ManagerOperationType::FinishServer),
+            108 => Ok(ManagerOperationType::UpdateGroupStatus),
+            109 => Ok(ManagerOperationType::FinishGroup),
             110 => Ok(ManagerOperationType::GetGroups),
+            111 => Ok(ManagerOperationType::AcquireMaster),
+            112 => Ok(ManagerOperationType::FinishMasterChange),
+            113 => Ok(ManagerOperationType::FollowNewMaster),
             _ => panic!("Unkown value: {}", value),
         }
     }
@@ -155,9 +167,12 @@ impl From<ManagerOperationType> for u32 {
             ManagerOperationType::GetNewHashRing => 105,
             ManagerOperationType::AddNodes => 106,
             ManagerOperationType::RemoveNodes => 107,
-            ManagerOperationType::UpdateServerStatus => 108,
-            ManagerOperationType::FinishServer => 109,
+            ManagerOperationType::UpdateGroupStatus => 108,
+            ManagerOperationType::FinishGroup => 109,
             ManagerOperationType::GetGroups => 110,
+            ManagerOperationType::AcquireMaster => 111,
+            ManagerOperationType::FinishMasterChange => 112,
+            ManagerOperationType::FollowNewMaster => 113,
         }
     }
 }
@@ -170,55 +185,18 @@ impl ManagerOperationType {
             ManagerOperationType::GetNewHashRing => 105u32.to_le_bytes(),
             ManagerOperationType::AddNodes => 106u32.to_le_bytes(),
             ManagerOperationType::RemoveNodes => 107u32.to_le_bytes(),
-            ManagerOperationType::UpdateServerStatus => 108u32.to_le_bytes(),
-            ManagerOperationType::FinishServer => 109u32.to_le_bytes(),
+            ManagerOperationType::UpdateGroupStatus => 108u32.to_le_bytes(),
+            ManagerOperationType::FinishGroup => 109u32.to_le_bytes(),
             ManagerOperationType::GetGroups => 110u32.to_le_bytes(),
+            ManagerOperationType::AcquireMaster => 111u32.to_le_bytes(),
+            ManagerOperationType::FinishMasterChange => 112u32.to_le_bytes(),
+            ManagerOperationType::FollowNewMaster => 113u32.to_le_bytes(),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GroupType {
-    Running = 1,
-    Add = 2,
-    Remove = 3,
-}
-
-impl TryFrom<u32> for GroupType {
-    type Error = ();
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(GroupType::Running),
-            2 => Ok(GroupType::Add),
-            3 => Ok(GroupType::Remove),
-            _ => panic!("Unkown value: {}", value),
-        }
-    }
-}
-
-impl From<GroupType> for u32 {
-    fn from(value: GroupType) -> Self {
-        match value {
-            GroupType::Running => 1,
-            GroupType::Add => 2,
-            GroupType::Remove => 3,
-        }
-    }
-}
-
-impl Display for GroupType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GroupType::Running => write!(f, "Running"),
-            GroupType::Add => write!(f, "Add"),
-            GroupType::Remove => write!(f, "Remove"),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ServerStatus {
+pub enum GroupStatus {
     Initializing = 201,
     PreTransfer = 202,
     Transferring = 203,
@@ -227,36 +205,36 @@ pub enum ServerStatus {
     Finished = 206,
 }
 
-impl TryFrom<u32> for ServerStatus {
+impl TryFrom<u32> for GroupStatus {
     type Error = String;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            201 => Ok(ServerStatus::Initializing),
-            202 => Ok(ServerStatus::PreTransfer),
-            203 => Ok(ServerStatus::Transferring),
-            204 => Ok(ServerStatus::PreFinish),
-            205 => Ok(ServerStatus::Finishing),
-            206 => Ok(ServerStatus::Finished),
+            201 => Ok(GroupStatus::Initializing),
+            202 => Ok(GroupStatus::PreTransfer),
+            203 => Ok(GroupStatus::Transferring),
+            204 => Ok(GroupStatus::PreFinish),
+            205 => Ok(GroupStatus::Finishing),
+            206 => Ok(GroupStatus::Finished),
             _ => Err(format!("Unkown value: {}", value)),
         }
     }
 }
 
-impl From<ServerStatus> for u32 {
-    fn from(value: ServerStatus) -> Self {
+impl From<GroupStatus> for u32 {
+    fn from(value: GroupStatus) -> Self {
         match value {
-            ServerStatus::Initializing => 201,
-            ServerStatus::PreTransfer => 202,
-            ServerStatus::Transferring => 203,
-            ServerStatus::PreFinish => 204,
-            ServerStatus::Finishing => 205,
-            ServerStatus::Finished => 206,
+            GroupStatus::Initializing => 201,
+            GroupStatus::PreTransfer => 202,
+            GroupStatus::Transferring => 203,
+            GroupStatus::PreFinish => 204,
+            GroupStatus::Finishing => 205,
+            GroupStatus::Finished => 206,
         }
     }
 }
 
-impl Display for ServerStatus {
+impl Display for GroupStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Initializing => write!(f, "Init"),
@@ -834,13 +812,13 @@ pub struct DeleteDirSendMetaData {
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
-pub struct UpdateServerStatusSendMetaData {
-    pub status: ServerStatus,
+pub struct UpdateGroupStatusSendMetaData {
+    pub status: GroupStatus,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
 pub struct GetClusterStatusRecvMetaData {
-    pub status: ClusterStatus,
+    pub status: i32,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
@@ -850,17 +828,17 @@ pub struct GetHashRingInfoRecvMetaData {
 
 #[derive(Serialize, Deserialize, PartialEq)]
 pub struct GetGroupsRecvMetaData {
-    pub groups_info: Vec<(String, Vec<(String, ServerStatus)>)>,
+    pub groups_info: Vec<Group>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
-pub struct AddNodesSendMetaData {
-    pub new_servers_info: Vec<(String, usize)>,
+pub struct AddGroupsSendMetaData {
+    pub new_groups_info: Vec<Group>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
-pub struct DeleteNodesSendMetaData {
-    pub deleted_servers_info: Vec<String>,
+pub struct DeleteGroupsSendMetaData {
+    pub deleted_groups_info: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
